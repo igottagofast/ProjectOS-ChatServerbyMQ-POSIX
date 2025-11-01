@@ -553,6 +553,21 @@ int main() {
 ---
 #Client
 
+ระบบ Client ทำหน้าที่เป็นส่วนติดต่อของผู้ใช้ (User Interface) สำหรับเชื่อมต่อและสื่อสารกับเซิร์ฟเวอร์ โดยทำหน้าที่รับ–ส่งข้อมูลผ่าน POSIX Message Queue ซึ่งเป็นกลไกสื่อสารระหว่างโปรเซส 
+
+ฝั่ง Client จะรับคำสั่งจากผู้ใช้ แปลงคำสั่งให้อยู่ในรูปข้อความที่ Server เข้าใจ เช่น "JOIN:...", "SAY:...", "DM:..." แล้วส่งขึ้นไปยังคิวกลางของเซิร์ฟเวอร์ชื่อ /server
+ในขณะเดียวกัน Client จะเปิดคิวรับข้อความของตนเอง (เช่น /client_alice) เพื่อรอรับข้อความที่ถูกส่งกลับมาจากเซิร์ฟเวอร์ เช่น ข้อความในห้อง, ข้อความส่วนตัว (DM), หรือข้อความระบบ (system message)
+
+ โดยที่โปรแกรมนี้ Client ถูกแบ่งออกเป็น 4 ส่วนหลัก ดังนี้
+
+พาร์ทที่ 1 : การเริ่มต้นและการเชื่อมต่อกับเซิร์ฟเวอร์
+
+พาร์ทที่ 2 : การรับและแสดงข้อความจากเซิร์ฟเวอร์
+
+พาร์ทที่ 3 : การส่งคำสั่งและข้อความจากผู้ใช้ไปยังเซิร์ฟเวอร์
+
+พาร์ทที่ 4 : ระบบ Heartbeat และการออกจากระบบ
+
 ```cpp
 #include <iostream>
 #include <thread>
@@ -567,65 +582,13 @@ int main() {
 
 std::atomic<bool> keep_running(true);
 
-// เพิ่มฟังก์ชันนี้
-void heartbeat_sender(std::string client_name, std::string server_qname)
-{
-    const std::string ping_msg = "PING:" + client_name;
-
-    while (keep_running)
-    {
-        std::this_thread::sleep_for(std::chrono::seconds(10));
-        if (!keep_running) break;
-
-        mqd_t server_q = mq_open(server_qname.c_str(), O_WRONLY | O_NONBLOCK);
-        if (server_q == -1) {
-            continue; 
-        }
-        
-        if (mq_send(server_q, ping_msg.c_str(), ping_msg.size() + 1, 0) == -1) {
-            // ถ้าส่งไม่ได้ ไม่เป็นไร
-        }
-        mq_close(server_q);
-    }
-}
-// ANSI color codes
 #define ANSI_COLOR_GREEN   "\x1b[32m"
 #define ANSI_COLOR_YELLOW  "\x1b[33m"
 #define ANSI_COLOR_RESET   "\x1b[0m"
 
-// function to listen to messages from server
-void listen_queue(const std::string &qname)
-{
-    struct mq_attr attr;
-    attr.mq_flags = 0;
-    attr.mq_maxmsg = 10;
-    attr.mq_msgsize = 1024;
-    attr.mq_curmsgs = 0;
-    // open client queue for listening
-    mqd_t client_q = mq_open(qname.c_str(), O_CREAT | O_RDONLY, 0644, &attr);
-    if (client_q == -1)
-    {
-        perror("mq_open client not complete.");
-        return;
-    }
-    // listen loop
-    char buf[1024];
-    while (keep_running)
-    {
-        struct timespec ts;
-        clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 2; // รอสูงสุด 2 วินาที
-
-        ssize_t n = mq_receive(client_q, buf, sizeof(buf), nullptr, &ts);
-        if (n > 0)
-        {
-            buf[n] = '\0';
-            std::cout << "\n" << ANSI_COLOR_YELLOW << buf << ANSI_COLOR_RESET 
-                  << "\n" << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
-        }
-    }
-    mq_close(client_q);
-}
+// ฟังก์ชัน heartbeat จะอธิบายในพาร์ทที่ 4
+void heartbeat_sender(std::string client_name, std::string server_qname);
+void listen_queue(const std::string &qname);
 
 int main(int argc, char *argv[])
 {
@@ -634,28 +597,75 @@ int main(int argc, char *argv[])
         std::cerr << "USAGE!!!    --->    ./client [client_name]" << std::endl;
         return 1;
     }
-    // keep client name
+
     std::string client_name = argv[1];
     std::string client_qname = "/client_" + client_name;
     std::string current_room = "";
 
-    // thread listen_queue from server
+    // สร้าง thread สำหรับฟังข้อความจาก server
     std::thread t(listen_queue, client_qname);
-    //t.detach();
 
-    //std::thread hb_thread(heartbeat_sender, client_name, "/server");
-    //hb_thread.detach();
-
-    // make queue for sending
+    // เปิดคิวของ server เพื่อส่งข้อมูล
     mqd_t server_q = mq_open("/server", O_WRONLY);
     std::string reg_msg = "REGISTER:" + client_qname;
     mq_send(server_q, reg_msg.c_str(), reg_msg.size() + 1, 0);
-    std::cout << "Registered as " << client_name << "\n" 
+
+    std::cout << "Registered as " << client_name << "\n"
               << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
 
+    // สร้าง thread สำหรับ heartbeat (จะอธิบายในพาร์ท 4)
     std::thread pinger(heartbeat_sender, client_name, "/server");
+```
+พาร์ทที่ 1: การเริ่มต้นและการเชื่อมต่อกับเซิร์ฟเวอร์ (Initialization & Registration)
 
-    auto confirm_action = [](const std::string& action) -> bool {
+พาร์ทนี้เป็นขั้นตอนเริ่มต้นของ client ตั้งแต่การ include library, การตั้งค่าตัวแปร,
+การประกาศ thread, และการลงทะเบียนตัวเองกับเซิร์ฟเวอร์ผ่าน message queue /server.
+
+```cpp
+void listen_queue(const std::string &qname)
+{
+    struct mq_attr attr;
+    attr.mq_flags = 0;
+    attr.mq_maxmsg = 10;
+    attr.mq_msgsize = 1024;
+    attr.mq_curmsgs = 0;
+
+    // เปิดคิวของ client เพื่อรับข้อความ
+    mqd_t client_q = mq_open(qname.c_str(), O_CREAT | O_RDONLY, 0644, &attr);
+    if (client_q == -1)
+    {
+        perror("mq_open client not complete.");
+        return;
+    }
+
+    char buf[1024];
+    while (keep_running)
+    {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += 2;
+
+        ssize_t n = mq_receive(client_q, buf, sizeof(buf), nullptr, &ts);
+        if (n > 0)
+        {
+            buf[n] = '\0';
+            std::cout << "\n" << ANSI_COLOR_YELLOW << buf << ANSI_COLOR_RESET
+                      << "\n" << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
+        }
+    }
+
+    mq_close(client_q);
+}
+
+```
+พาร์ทที่ 2: การรับและแสดงข้อความจากเซิร์ฟเวอร์ (Listening / Incoming Messages)
+
+พาร์ทนี้คือ “หู” ของ client ที่ฟังทุกข้อความจากเซิร์ฟเวอร์
+และแสดงผลบนหน้าจอทันทีโดยใช้สีเพื่อแยกข้อความระบบกับ prompt พิมพ์คำสั่ง.
+
+```cpp
+    // ฟังก์ชันยืนยันก่อนทำการ quit หรือ leave
+    auto confirm_action = [](const std::string &action) -> bool {
         std::cout << ANSI_COLOR_YELLOW << "Are you sure you want to " << action << "? (y/n): " << ANSI_COLOR_RESET;
         std::string confirm_line;
         std::getline(std::cin, confirm_line);
@@ -698,13 +708,11 @@ int main(int argc, char *argv[])
             std::string send_msg = "DM:" + client_name + ":" + target + ":" + text;
             mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0);
         }
-       
         else if (msg.rfind("WHO:", 0) == 0)
         {
             std::string send_msg = "WHO:" + client_name + ">" + current_room;
             mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0);
         }
-    
         else if (msg.rfind("LEAVE:", 0) == 0)
         {
             if (current_room.empty()) {
@@ -717,54 +725,85 @@ int main(int argc, char *argv[])
                 std::cout << "You left room #" << room_that_left << std::endl;
             }
         }
-        else if (msg.rfind("QUIT:", 0) == 0) {
+        else if (msg.rfind("QUIT:", 0) == 0)
+        {
             if (confirm_action("quit the server")) {
-                
                 std::string payload;
 
-                // ถ้าอยู่ในห้อง, ให้ถามวิธีออก
                 if (!current_room.empty()) {
                     std::cout << ANSI_COLOR_YELLOW << "How do you want to quit?" << ANSI_COLOR_RESET << std::endl;
                     std::cout << "1. Just quit (Announce 'quit' to room)" << std::endl;
                     std::cout << "2. Announce 'leave' then 'quit' (Two messages)" << std::endl;
                     std::cout << ANSI_COLOR_GREEN << "Enter choice (1 or 2): " << ANSI_COLOR_RESET << std::flush;
-                    
+
                     std::string choice_line;
                     std::getline(std::cin, choice_line);
-                    
-                    if (choice_line == "2") {
-                        // นี่คือทางเลือกที่ 2
-                        payload = "QUIT:" + client_name + ":leave_then_quit";
-                    } else {
-                        // ถ้าพิมพ์ 1 หรืออื่นๆ, ใช้ค่า default
-                        // นี่คือทางเลือกที่ 1
-                        payload = "QUIT:" + client_name;
-                    }
-                } else {
-                    // ถ้าไม่อยู่ในห้อง, ก็ส่ง quit ธรรมดา
-                    // นี่คือทางเลือกที่ 1
-                    payload = "QUIT:" + client_name;
-                }
 
-                keep_running = false; // บอก thread อื่นๆ ให้หยุด
-                current_room = ""; 
-            
+                    if (choice_line == "2")
+                        payload = "QUIT:" + client_name + ":leave_then_quit";
+                    else
+                        payload = "QUIT:" + client_name;
+                } 
+                else payload = "QUIT:" + client_name;
+
+                keep_running = false;
+                current_room = "";
+
                 mq_send(server_q, payload.c_str(), payload.size() + 1, 0);
-                break; // ออกจาก loop (main thread)
+                break;
             }
         }
         else {
             std::cout << "command not found" << std::endl;
         }
+
         std::cout << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
     }
+
+```
+พาร์ทที่ 3: การส่งคำสั่งจากผู้ใช้ไปยังเซิร์ฟเวอร์ (Outgoing Commands / User Input)
+
+พาร์ทนี้คือ “ปาก” ของ client ที่รับคำสั่งจากผู้ใช้
+แล้วแปลงเป็นข้อความ protocol เพื่อส่งไปยังเซิร์ฟเวอร์ผ่าน message queue /server.
+
+
+```cpp
+// ฟังก์ชัน Heartbeat: ส่ง PING เป็นระยะเพื่อบอก server ว่ายังเชื่อมต่ออยู่
+void heartbeat_sender(std::string client_name, std::string server_qname)
+{
+    const std::string ping_msg = "PING:" + client_name;
+
+    while (keep_running)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        if (!keep_running) break;
+
+        mqd_t server_q = mq_open(server_qname.c_str(), O_WRONLY | O_NONBLOCK);
+        if (server_q == -1) {
+            continue;
+        }
+
+        mq_send(server_q, ping_msg.c_str(), ping_msg.size() + 1, 0);
+        mq_close(server_q);
+    }
+}
+
+// ปิดระบบอย่างปลอดภัยหลังจากออกจาก loop หลัก
     mq_close(server_q);
     t.join();
     pinger.join();
     mq_unlink(client_qname.c_str());
     return 0;
 }
+
+
 ```
+พาร์ทที่ 4: ระบบ Heartbeat และการออกจากระบบอย่างปลอดภัย (Heartbeat & Graceful Shutdown)
+
+พาร์ทนี้เป็นระบบตรวจสอบการเชื่อมต่อ และขั้นตอนออกจากระบบให้สมบูรณ์
+เพื่อให้ server รู้ว่า client ยังออนไลน์หรือออกจากระบบแล้วจริง ๆ
+
+
 ---
 #How to complie
 
