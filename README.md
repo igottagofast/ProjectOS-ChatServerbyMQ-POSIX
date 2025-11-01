@@ -1016,12 +1016,7 @@ break ออกจากลูป แล้ว clean up ทุกอย่าง
 How to complie
 ---
 
-C++ POSIX Message Queue Chat
-โปรเจกต์นี้คือระบบแชทเซิร์ฟเวอร์และไคลเอนต์แบบหลายห้อง (multi-room) ที่สื่อสารกันผ่าน POSIX Message Queues (mqueue.h) บนระบบปฏิบัติการ Linux/POSIX
-
-Server (server.cpp): ทำหน้าที่เป็นศูนย์กลาง (Router) รับข้อความ, จัดการสถานะของห้องและผู้ใช้, และใช้ Thread Pool (Broadcaster) เพื่อกระจายข้อความไปยังไคลเอนต์ที่อยู่ในห้องเดียวกัน
-
-Client (client.cpp): ทำหน้าที่เชื่อมต่อกับเซิร์ฟเวอร์, รับส่งข้อความ, และมีระบบ Heartbeat (PING) เพื่อแจ้งให้เซิร์ฟเวอร์ทราบว่ายังเชื่อมต่ออยู่
+โปรแกรมนี้เป็นระบบแชตแบบ Client–Server ที่ใช้ POSIX Message Queue (mqueue.h) เพื่อสื่อสารระหว่างโปรเซส โดยใช้ multi-threading ในฝั่ง client และ server เพื่อแยกงาน เช่น การส่ง heartbeat, การ broadcast ข้อความ และการตรวจสอบ client ที่หลุดการเชื่อมต่อ
 
 ---
 การคอมไพล์และใช้งาน (Compilation & Usage)
