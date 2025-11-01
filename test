@@ -1,0 +1,137 @@
+#include <iostream>
+#include <vector>
+#include <thread>
+#include <chrono>
+#include <fstream>  
+#include <string>
+#include <mqueue.h>
+#include <fcntl.h>
+#include <sys/stat.h>   
+#include <cstring>
+#include <unistd.h>
+#include <sys/types.h>  
+#include <cstdlib>    
+#include <cerrno>     
+
+/**
+ * @brief Task สำหรับ Client จำลอง
+ * (นี่คือเวอร์ชัน "หุ่นยนต์" ของ client3.cpp)
+ */
+void test_client_task(std::string client_name, int messages_to_send, const std::string& room) {
+    mqd_t server_q;
+    struct mq_attr attr;
+    attr.mq_flags = O_NONBLOCK; 
+    attr.mq_maxmsg = 10;
+    attr.mq_msgsize = 1024;
+    attr.mq_curmsgs = 0;
+
+    server_q = mq_open("/server", O_WRONLY | O_NONBLOCK, 0644, &attr);
+    if (server_q == -1) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // รอ 0.2 วิ
+        server_q = mq_open("/server", O_WRONLY | O_NONBLOCK, 0644, &attr);
+        if (server_q == -1) {
+             std::cerr << "Tester mq_open server_q failed for " << client_name << std::endl;
+             return;
+        }
+    }
+
+    // 1. ส่ง REGISTER
+    std::string reg_msg = "REGISTER:/client_" + client_name;
+    mq_send(server_q, reg_msg.c_str(), reg_msg.size() + 1, 0);
+
+    // 2. ส่ง JOIN
+    std::string join_msg = "JOIN:" + client_name + ": " + room;
+    mq_send(server_q, join_msg.c_str(), join_msg.size() + 1, 0);
+    
+    // 3. ส่งข้อความ SAY (ตาม Format ของ server3.cpp)
+    for (int i = 0; i < messages_to_send; ++i) {
+        std::string msg = "Test message " + std::to_string(i);
+        std::string send_msg = "SAY:[" + client_name + "]: " + msg; 
+        
+        if (mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0) == -1) {
+            if (errno == EAGAIN) { // ถ้าคิวเต็ม (Server ทำงานไม่ทัน)
+                std::this_thread::sleep_for(std::chrono::milliseconds(50)); // รอ
+                mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0); // ลองอีกครั้ง
+            }
+        }
+    }
+    
+    // 4. ส่ง PING (สำคัญมาก! เพื่อไม่ให้โดน cleaner เตะ)
+    std::string ping_msg = "PING:" + client_name;
+    mq_send(server_q, ping_msg.c_str(), ping_msg.size() + 1, 0);
+
+    mq_close(server_q);
+}
+
+int main() {
+    // --- ค่าที่ใช้ทดสอบ (ปรับได้) ---
+    const int NUM_CLIENTS = 50;           // 50 Client จำลอง
+    const int MSG_PER_CLIENT = 100;       // ส่งคนละ 100 ข้อความ
+    const std::string TEST_ROOM = "room1"; // ยิงไปที่ room1
+    const int TOTAL_MESSAGES = NUM_CLIENTS * MSG_PER_CLIENT; // (รวม 5000)
+
+    // อ่านค่า NUM_BROADCASTERS จาก Environment (สำหรับบันทึกลง Sheet)
+    int num_broadcasters = 4; // Default
+    const char* env_p = std::getenv("NUM_BROADCASTERS");
+    if (env_p != nullptr) num_broadcasters = std::atoi(env_p);
+    // --- จบส่วนตั้งค่า ---
+
+    std::cout << "Starting performance test..." << std::endl;
+    std::cout << "Config: Broadcasters=" << num_broadcasters 
+              << ", Clients=" << NUM_CLIENTS 
+              << ", Msgs/Client=" << MSG_PER_CLIENT << std::endl;
+
+    std::vector<std::thread> threads;
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    // สร้าง Client จำลอง $N$ ตัว
+    for (int i = 0; i < NUM_CLIENTS; ++i) {
+        threads.emplace_back(test_client_task, "tester" + std::to_string(i), MSG_PER_CLIENT, TEST_ROOM);
+    }
+
+    // รอให้ Client ทุกตัวทำงานเสร็จ
+    for (auto& t : threads) {
+        t.join();
+    }
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end_time - start_time;
+    double throughput = TOTAL_MESSAGES / duration.count(); // ข้อความต่อวินาที
+
+    std::cout << "--------------------------------" << std::endl;
+    std::cout << "Test finished in " << duration.count() << " seconds." << std::endl;
+    std::cout << "Total Messages: " << TOTAL_MESSAGES << std::endl;
+    std::cout << "Throughput: " << throughput << " messages/sec." << std::endl;
+    std::cout << "--------------------------------" << std::endl;
+
+    // --- เขียนผลลัพธ์ลง CSV (Sheet) ---
+    // (ต้องรัน docker-compose.yml เพื่อสร้าง Volume)
+    mkdir("./performance_results", 0755); // สร้าง folder (ถ้ายังไม่มี)
+    
+    // เปิดไฟล์แบบ "ต่อท้าย" (append)
+    std::ofstream result_sheet("./performance_results/performance.csv", std::ios_base::app);
+    if (result_sheet.is_open()) {
+        result_sheet.seekp(0, std::ios::end);
+        if (result_sheet.tellp() == 0) { // เขียน Header ถ้านี่คือไฟล์ใหม่
+            result_sheet << "Timestamp,NumBroadcasters,NumClients,MsgsPerClient,TotalTimeSec,ThroughputMsgPerSec\n";
+        }
+        
+        char time_buf[80];
+        auto now = std::chrono::system_clock::now();
+        auto in_time_t = std::chrono::system_clock::to_time_t(now);
+        strftime(time_buf, 80, "%Y-%m-%d %H:%M:%S", std::localtime(&in_time_t));
+
+        // บันทึกผล
+        result_sheet << time_buf << ","
+                     << num_broadcasters << ","
+                     << NUM_CLIENTS << ","
+                     << MSG_PER_CLIENT << ","
+                     << duration.count() << ","
+                     << throughput << "\n";
+        result_sheet.close();
+        std::cout << "Results saved to ./performance_results/performance.csv" << std::endl;
+    } else {
+        std::cerr << "Error: Could not open result sheet file." << std::endl;
+    }
+    return 0;
+}
