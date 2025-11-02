@@ -117,6 +117,10 @@ worker เป็น consumer (เรียก pop)
 
 Worker ที่กระจายข้อความ:
 ```cpp
+// worker กระจายข้อความในห้อง (ไม่ส่งกลับให้ผู้ส่ง)
+// - หา room ของผู้ส่ง หรือใช้ target_room
+// - เดินรายชื่อสมาชิกแล้วส่งเข้าคิวของแต่ละคน
+// - ถ้าคิวปลายทางเต็ม ให้ข้าม/แจ้งเตือนแบบ best-effort
 void broadcaster_worker()
 {
     std::cout << "Broadcaster thread " << std::this_thread::get_id() << " started." << std::endl;
@@ -213,6 +217,12 @@ std::cout << "Broadcaster pool (size=" << NUM_BROADCASTERS << ") started." << st
 การจัดการห้องและสมาชิก (JOIN / LEAVE / WHO)
 - JOIN (ย้ายเข้าห้อง)
 ```cpp
+/* JOIN
+   - parse "JOIN:<name>: <room>"
+   - เอา <name> ออกจากทุกห้อง
+   - ถ้า <room> ยังไม่มีให้สร้าง แล้วใส่ชื่อเข้าไป
+   - ส่ง SYSTEM msg ว่าเข้าห้อง (#room)
+*/
 void handle_join(const std::string &msg)
 {
     WriteLock lock(registry_lock);
@@ -260,6 +270,7 @@ void handle_join(const std::string &msg)
 ```
 - LEAVE (ออกจากห้องปัจจุบัน)
 ```cpp
+// ผู้ใช้ออกจากห้อง และประกาศออกห้อง
 void handle_leave(const std::string &msg)
 {
     // msg รูปแบบ: "LEAVE:<client_name>"
@@ -291,6 +302,7 @@ void handle_leave(const std::string &msg)
 
 - WHO (ขอดูว่าใครอยู่ในห้อง)
 ```cpp
+// ตอบรายชื่อสมาชิกในห้องให้ผู้ร้องขอ
 void handle_who(const std::string &msg)
 {
     ReadLock lock(registry_lock);
@@ -333,6 +345,7 @@ void handle_who(const std::string &msg)
 การจัดการการเชื่อมต่อของผู้ใช้ (REGISTER / QUIT / DM)
 - REGISTER (ผู้ใช้เข้าระบบครั้งแรก)
 ```cpp
+// ลงทะเบียนคิวของ client และบันทึก heartbeat แรก
 void handle_register(const std::string &msg)
 {
     // msg รูปแบบ: "REGISTER:/client_name"
@@ -359,6 +372,7 @@ void handle_register(const std::string &msg)
 
 - DM (ส่งข้อความส่วนตัว)
 ```cpp
+// ส่งข้อความส่วนตัวถึงเป้าหมาย (ถ้าไม่พบให้แจ้งกลับผู้ส่ง)
 void handle_dm(const std::string &msg)
 {
     ReadLock lock(registry_lock);
@@ -403,6 +417,7 @@ void handle_dm(const std::string &msg)
 
 - QUIT (ผู้ใช้ออกจากระบบ)
 ```cpp
+// ลบผู้ใช้ออกจากทุกที่ และประกาศ quit (เลือกโหมดได้)
 void handle_quit(const std::string &msg)
 {
     // "QUIT:<name>" หรือ "QUIT:<name>:<mode>"
@@ -492,6 +507,7 @@ void handle_quit(const std::string &msg)
 ปัญหาในระบบ chat จริง: client อาจ “ปิดโปรแกรมไปเฉย ๆ” โดยไม่ส่ง QUIT
 ถ้าไม่จัดการ เซิร์ฟเวอร์จะคิดว่าคนนั้นยังอยู่ในห้อง ซึ่งในโปรเเกรมนี้ป้องกันด้วย heartbeat ทำหน้าที่ อัปเดตเวลา “ลูกค้าคนนี้ยังหายใจอยู่” ทุกครั้งที่ client ส่ง PING:<name> มา
 ```cpp
+// อัปเดต heartbeat ของผู้ใช้ (ยังออนไลน์)
 void handle_ping(const std::string &msg)
 {
     std::string client_name = msg.substr(5); // "PING:<name>"
@@ -512,6 +528,8 @@ heartbeat_cleaner() — ฝั่งล้างศพ รันเป็น thr
 
 :เซิร์ฟเวอร์สามารถจัดการ client ที่ disconnect ไปเงียบ ๆ โดยอัตโนมัติ → ไม่มีผีค้างห้อง
 ```cpp
+// เฝ้าดู heartbeat: ถ้าเงียบเกิน TIMEOUT -> cleanup/quit
+// รอบตรวจทุก SLEEP_SEC
 void heartbeat_cleaner()
 {
     while (true)
@@ -567,6 +585,8 @@ Main Server Loop (Router หลัก)
 
 ดังนั้น ส่วน Main จะทำหน้าที่ “สร้างและส่งงาน” ในขณะที่ส่วน Broadcast จะทำหน้าที่ “รับงานและกระจายต่อ”
 ```cpp
+// เริ่มเธรด broadcaster + heartbeat, เปิดคิว /server และวนรับคำสั่ง
+// คำสั่งที่รับ: REGISTER/JOIN/SAY/DM/WHO/LEAVE/QUIT/PING
 int main()
 {
     pthread_rwlock_init(&registry_lock, NULL);
@@ -675,6 +695,7 @@ thread นี้จะเปิด queue นั้นในโหมดอ่า
 //   - เปิด/สร้าง message queue ส่วนตัวของ client (ชื่อ /client_<name>)
 //   - รอรับข้อความจาก server แล้วพิมพ์ออกหน้าจอ
 //   - จะหยุดเมื่อ keep_running กลายเป็น false
+// ฟังข้อความจากคิวส่วนตัว แล้วพิมพ์ออกหน้าจอ
 void listen_queue(const std::string &qname)
 {
     // ตั้ง attribute ของ message queue ฝั่ง client
@@ -749,6 +770,8 @@ void listen_queue(const std::string &qname)
 
 
 ```cpp
+// เปิด /server, ลงทะเบียน, วนอ่านคำสั่งจากผู้ใช้ แล้วส่งต่อไป server
+// คำสั่งฝั่ง client: SAY/DM/JOIN/WHO/LEAVE/QUIT
 int main(int argc, char *argv[])
 {
     // ต้องมีชื่อ client ตอนรันโปรแกรม เช่น ./client alice
