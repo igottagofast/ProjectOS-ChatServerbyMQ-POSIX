@@ -1,137 +1,136 @@
 #include <iostream>
-#include <vector>
-#include <thread>
-#include <chrono>
-#include <fstream>  
-#include <string>
 #include <mqueue.h>
-#include <fcntl.h>
-#include <sys/stat.h>   
+#include <chrono>
+#include <thread>
+#include <string>
 #include <cstring>
-#include <unistd.h>
-#include <sys/types.h>  
-#include <cstdlib>    
-#include <cerrno>     
+#include <cerrno>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <mutex>
+#include <condition_variable>
+#include <unistd.h> // สำหรับ getpid()
 
-/**
- * @brief Task สำหรับ Client จำลอง
- * (นี่คือเวอร์ชัน "หุ่นยนต์" ของ client3.cpp)
- */
-void test_client_task(std::string client_name, int messages_to_send, const std::string& room) {
-    mqd_t server_q;
+std::mutex mtx;
+std::condition_variable cv;
+std::chrono::high_resolution_clock::time_point send_time;
+double total_latency_ms = 0.0;
+int received_count = 0;
+
+void listen_queue(const std::string &client_qname)
+{
+    std::string qname = "/client_" + client_qname;
     struct mq_attr attr;
-    attr.mq_flags = O_NONBLOCK; 
+    attr.mq_flags = 0;
     attr.mq_maxmsg = 10;
     attr.mq_msgsize = 1024;
     attr.mq_curmsgs = 0;
 
-    server_q = mq_open("/server", O_WRONLY | O_NONBLOCK, 0644, &attr);
-    if (server_q == -1) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(200)); // รอ 0.2 วิ
-        server_q = mq_open("/server", O_WRONLY | O_NONBLOCK, 0644, &attr);
-        if (server_q == -1) {
-             std::cerr << "Tester mq_open server_q failed for " << client_name << std::endl;
-             return;
-        }
+    mqd_t client_q = mq_open(qname.c_str(), O_CREAT | O_RDONLY, 0644, &attr);
+    if (client_q == -1)
+    {
+        perror("mq_open client");
+        return;
     }
 
-    // 1. ส่ง REGISTER
-    std::string reg_msg = "REGISTER:/client_" + client_name;
-    mq_send(server_q, reg_msg.c_str(), reg_msg.size() + 1, 0);
+    char buf[1024];
+    while (true)
+    {
+        ssize_t n = mq_receive(client_q, buf, sizeof(buf), nullptr);
+        if (n > 0)
+        {
+            buf[n] = '\0';
+            std::string msg(buf);
 
-    // 2. ส่ง JOIN
-    std::string join_msg = "JOIN:" + client_name + ": " + room;
-    mq_send(server_q, join_msg.c_str(), join_msg.size() + 1, 0);
-    
-    // 3. ส่งข้อความ SAY (ตาม Format ของ server3.cpp)
-    for (int i = 0; i < messages_to_send; ++i) {
-        std::string msg = "Test message " + std::to_string(i);
-        std::string send_msg = "SAY:[" + client_name + "]: " + msg; 
-        
-        if (mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0) == -1) {
-            if (errno == EAGAIN) { // ถ้าคิวเต็ม (Server ทำงานไม่ทัน)
-                std::this_thread::sleep_for(std::chrono::milliseconds(50)); // รอ
-                mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0); // ลองอีกครั้ง
+            // สมมติว่า server broadcast กลับมา message เดิม
+            if (msg.find("message_") != std::string::npos)
+            {
+                auto end_time = std::chrono::high_resolution_clock::now();
+                double latency_ms = std::chrono::duration<double, std::milli>(end_time - send_time).count();
+
+                std::unique_lock<std::mutex> lock(mtx);
+                total_latency_ms += latency_ms;
+                received_count++;
+                cv.notify_one();
             }
         }
     }
-    
-    // 4. ส่ง PING (สำคัญมาก! เพื่อไม่ให้โดน cleaner เตะ)
-    std::string ping_msg = "PING:" + client_name;
-    mq_send(server_q, ping_msg.c_str(), ping_msg.size() + 1, 0);
 
-    mq_close(server_q);
+    mq_close(client_q);
 }
 
-int main() {
-    // --- ค่าที่ใช้ทดสอบ (ปรับได้) ---
-    const int NUM_CLIENTS = 50;           // 50 Client จำลอง
-    const int MSG_PER_CLIENT = 100;       // ส่งคนละ 100 ข้อความ
-    const std::string TEST_ROOM = "room1"; // ยิงไปที่ room1
-    const int TOTAL_MESSAGES = NUM_CLIENTS * MSG_PER_CLIENT; // (รวม 5000)
+int main()
+{
+    const int TOTAL_MESSAGES = 100000; // จำนวนข้อความที่ต้องการวัด latency
+    std::string CLIENT_NAME = "loadtester_" + std::to_string(getpid());
 
-    // อ่านค่า NUM_BROADCASTERS จาก Environment (สำหรับบันทึกลง Sheet)
-    int num_broadcasters = 4; // Default
-    const char* env_p = std::getenv("NUM_BROADCASTERS");
-    if (env_p != nullptr) num_broadcasters = std::atoi(env_p);
-    // --- จบส่วนตั้งค่า ---
+    // ตั้งค่า queue attributes
+    struct mq_attr attr{};
+    attr.mq_flags = 0;
+    attr.mq_maxmsg = 1000;
+    attr.mq_msgsize = 1024;
+    attr.mq_curmsgs = 0;
 
-    std::cout << "Starting performance test..." << std::endl;
-    std::cout << "Config: Broadcasters=" << num_broadcasters 
-              << ", Clients=" << NUM_CLIENTS 
-              << ", Msgs/Client=" << MSG_PER_CLIENT << std::endl;
-
-    std::vector<std::thread> threads;
-    auto start_time = std::chrono::high_resolution_clock::now();
-
-    // สร้าง Client จำลอง $N$ ตัว
-    for (int i = 0; i < NUM_CLIENTS; ++i) {
-        threads.emplace_back(test_client_task, "tester" + std::to_string(i), MSG_PER_CLIENT, TEST_ROOM);
+    mqd_t server_q = mq_open("/server", O_WRONLY | O_CREAT, 0644, &attr);
+    if (server_q == -1)
+    {
+        perror("mq_open /server");
+        return 1;
     }
 
-    // รอให้ Client ทุกตัวทำงานเสร็จ
-    for (auto& t : threads) {
-        t.join();
-    }
+    // Register + Join
+    std::string reg_msg = "REGISTER:/client_" + CLIENT_NAME;
+    mq_send(server_q, reg_msg.c_str(), reg_msg.size() + 1, 0);
 
-    auto end_time = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> duration = end_time - start_time;
-    double throughput = TOTAL_MESSAGES / duration.count(); // ข้อความต่อวินาที
+    std::string join_msg = "JOIN:" + CLIENT_NAME + ": room1";
+    mq_send(server_q, join_msg.c_str(), join_msg.size() + 1, 0);
 
-    std::cout << "--------------------------------" << std::endl;
-    std::cout << "Test finished in " << duration.count() << " seconds." << std::endl;
-    std::cout << "Total Messages: " << TOTAL_MESSAGES << std::endl;
-    std::cout << "Throughput: " << throughput << " messages/sec." << std::endl;
-    std::cout << "--------------------------------" << std::endl;
+    std::thread listener_thread(listen_queue, CLIENT_NAME);
+    listener_thread.detach();
 
-    // --- เขียนผลลัพธ์ลง CSV (Sheet) ---
-    // (ต้องรัน docker-compose.yml เพื่อสร้าง Volume)
-    mkdir("./performance_results", 0755); // สร้าง folder (ถ้ายังไม่มี)
-    
-    // เปิดไฟล์แบบ "ต่อท้าย" (append)
-    std::ofstream result_sheet("./performance_results/performance.csv", std::ios_base::app);
-    if (result_sheet.is_open()) {
-        result_sheet.seekp(0, std::ios::end);
-        if (result_sheet.tellp() == 0) { // เขียน Header ถ้านี่คือไฟล์ใหม่
-            result_sheet << "Timestamp,NumBroadcasters,NumClients,MsgsPerClient,TotalTimeSec,ThroughputMsgPerSec\n";
+    std::this_thread::sleep_for(std::chrono::seconds(1)); // รอให้ join เสร็จก่อน
+
+    std::cout << "Starting latency test...\n";
+
+    // จับเวลาเริ่มต้นของการทดสอบทั้งหมด
+    auto test_start = std::chrono::high_resolution_clock::now();
+
+    for (int i = 0; i < TOTAL_MESSAGES; ++i)
+    {
+        std::string msg = "SAY:[" + CLIENT_NAME + "]: message_" + std::to_string(i);
+
+        // จับเวลาเริ่มก่อนส่ง
+        send_time = std::chrono::high_resolution_clock::now();
+
+        if (mq_send(server_q, msg.c_str(), msg.size() + 1, 0) == -1)
+        {
+            perror("mq_send");
+            continue;
         }
-        
-        char time_buf[80];
-        auto now = std::chrono::system_clock::now();
-        auto in_time_t = std::chrono::system_clock::to_time_t(now);
-        strftime(time_buf, 80, "%Y-%m-%d %H:%M:%S", std::localtime(&in_time_t));
 
-        // บันทึกผล
-        result_sheet << time_buf << ","
-                     << num_broadcasters << ","
-                     << NUM_CLIENTS << ","
-                     << MSG_PER_CLIENT << ","
-                     << duration.count() << ","
-                     << throughput << "\n";
-        result_sheet.close();
-        std::cout << "Results saved to ./performance_results/performance.csv" << std::endl;
-    } else {
-        std::cerr << "Error: Could not open result sheet file." << std::endl;
+        // รอจนกว่าจะได้รับข้อความตอบกลับจาก listener
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, []
+                { return received_count > 0; });
+        received_count = 0; // reset
     }
+
+    // จับเวลาสิ้นสุดของการทดสอบทั้งหมด
+    auto test_end = std::chrono::high_resolution_clock::now();
+
+    // คำนวณเวลารวมและ throughput
+    std::chrono::duration<double> total_time = test_end - test_start;
+    double throughput = TOTAL_MESSAGES / total_time.count();
+    double avg_latency = total_latency_ms / TOTAL_MESSAGES;
+
+    // แสดงผล
+    std::cout << "--------------------------------\n";
+    std::cout << "Messages: " << TOTAL_MESSAGES << "\n";
+    std::cout << "Total time: " << total_time.count() << " sec\n";
+    std::cout << "Throughput: " << throughput << " msg/sec\n";
+    std::cout << "Average latency: " << avg_latency << " ms\n";
+    std::cout << "--------------------------------\n";
+
+    mq_close(server_q);
     return 0;
 }
