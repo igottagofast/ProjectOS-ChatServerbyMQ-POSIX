@@ -683,148 +683,220 @@ Client
 
  โดยที่โปรแกรมนี้ Client ถูกแบ่งออกเป็น 3 ส่วนหลัก ดังนี้
 
-พาร์ทที่ 1:ระบบรับข้อความจากเซิร์ฟเวอร์
+พาร์ทที่ 1:เธรดเบื้องหลัง: Heartbeat และ Listener
 
-ฟังก์ชัน listen_queue() ทำหน้าที่เป็น "หู" ของ client เซิร์ฟเวอร์จะส่งข้อความถึง client ผ่าน message queue ส่วนตัว เช่น /client_alice ของ alice
-thread นี้จะเปิด queue นั้นในโหมดอ่าน (O_RDONLY) แล้ววนรอข้อความเข้ามา เมื่อมีข้อความใหม่ (เช่น broadcast จากห้อง, DM ส่วนตัว, system message ว่ามีคนเข้า/ออกห้อง) มันจะแสดงออกทางหน้าจอ
-ใช้ mq_timedreceive() แทน mq_receive() เพราะถ้าใช้แบบบล็อกถาวร เราจะ kill thread ยากตอน QUIT แต่แบบ timed จะ timeout ทุก 2 วินาที แล้วเช็ค keep_running เพื่อออกได้
+  1.1 Heartbeat Thread : เซิร์ฟเวอร์มีระบบ “ล้าง client ที่หายไปนาน” อยู่แล้ว มันจะดูว่า client คนไหนไม่ส่ง PING:<name> ภายในเวลาที่กำหนดก็จะถือว่าหลุด แล้วไปลบจากห้องและ broadcast บอกคนอื่น เพราะฉะนั้น client ทุกตัวต้องมีตัวส่ง heartbeat เป็นระยะ
+      ใช้ O_NONBLOCK เพราะไม่อยากให้ heartbeat ไปค้างถ้า server คิวเต็มชั่วคราว ,ใช้การเปิด/ปิดคิวรอบต่อรอบ เพราะง่ายและชัดเจน
+  ```cpp
+//  HEARTBEAT SYSTEM
+//  ส่ง "PING:<client_name>" ไปหา server ทุก ๆ 10 วินาที
 
-```cpp
-// ฟังก์ชันนี้จะรันอยู่ใน thread แยกตลอดอายุการใช้งานของ client
-// หน้าที่:
-//   - เปิด/สร้าง message queue ส่วนตัวของ client (ชื่อ /client_<name>)
-//   - รอรับข้อความจาก server แล้วพิมพ์ออกหน้าจอ
-//   - จะหยุดเมื่อ keep_running กลายเป็น false
-// ฟังข้อความจากคิวส่วนตัว แล้วพิมพ์ออกหน้าจอ
-void listen_queue(const std::string &qname)
+void heartbeat_sender(const std::string &client_name, const std::string &server_qname)
 {
-    // ตั้ง attribute ของ message queue ฝั่ง client
-    struct mq_attr attr;
-    attr.mq_flags = 0;         // 0 = blocking mode โดยปกติ
-    attr.mq_maxmsg = 10;       // เก็บได้ทีละ ~10 ข้อความค้าง
-    attr.mq_msgsize = 1024;    // ข้อความยาวสุด 1024 bytes
-    attr.mq_curmsgs = 0;
+    const std::string ping_msg = "PING:" + client_name;
 
-    // เปิด (หรือสร้างถ้ายังไม่มี) คิวชื่อ qname เช่น "/client_alice" ในโหมดอ่าน
-    // 0644 = permission (owner rw, group r, other r)
-    mqd_t client_q = mq_open(qname.c_str(), O_CREAT | O_RDONLY, 0644, &attr);
-    if (client_q == -1)
-    {
-        perror("mq_open client not complete.");
-        return;
-    }
-
-    char buf[1024]; // buffer สำหรับเก็บข้อความที่อ่านมาได้จาก server
-
-    // วนรับข้อความจนกว่าจะถูกสั่งหยุด
     while (keep_running)
     {
-        // เราจะใช้ mq_timedreceive() เพื่อไม่บล็อกตลอดไป
-        // กำหนด timeout = ตอนนี้ + 2 วินาที
+        // เว้นช่วงก่อนส่งรอบถัดไป
+        std::this_thread::sleep_for(std::chrono::seconds(10));
+        if (!keep_running)
+            break;  // ถ้า main สั่งปิด ก็ออกทันที
+
+        // เปิดคิวของ server ในโหมดเขียน (non-blocking เผื่อ server ไม่พร้อม)
+        mqd_t server_q = mq_open(server_qname.c_str(), O_WRONLY | O_NONBLOCK);
+        if (server_q == -1) {
+            // เปิดไม่ได้ก็ปล่อยรอบนี้ไป
+            continue;
+        }
+
+        // ส่ง ping เพื่อบอกว่าคลายเอนต์นี้ยังออนไลน์อยู่
+        mq_send(server_q, ping_msg.c_str(), ping_msg.size() + 1, 0);
+        mq_close(server_q);
+    }
+}
+
+  ```
+  1.2 Listener Thread : ฟังก์ชัน listen_queue() ทำหน้าที่เป็น "หู" ของ client เซิร์ฟเวอร์จะส่งข้อความถึง อีกเธรดหนึ่งมีหน้าที่ “นั่งรอ” ว่า server จะส่งอะไรมาให้เราไหม  อาจเป็นข้อความจากคนอื่นในห้อง, system message, ผลลัพธ์ของคำสั่ง WHO, หรือข้อความ         error เวลา DM ไม่เจอคน อยากให้เธรดนี้หยุดได้เมื่อผู้ใช้ QUIT จึงใช้ mq_timedreceive() ไม่ใช้ mq_receive() แบบบล็อกยาว ๆ เพื่อให้ทุก ๆ 2 วินาที เธรดจะมีโอกาสเช็ค keep_running แล้วออกจาก loop ได้
+
+```cpp
+void listen_queue(const std::string &qname)
+{
+    struct mq_attr attr;
+    attr.mq_flags   = 0;
+    attr.mq_maxmsg  = 10;
+    attr.mq_msgsize = 1024;
+    attr.mq_curmsgs = 0;
+
+    // เปิดคิวของ client เพื่อรอข้อความที่ server ส่งมา
+    mqd_t client_q = mq_open(qname.c_str(), O_CREAT | O_RDONLY, 0644, &attr);
+
+    char buf[1024];
+    while (keep_running)
+    {
+        // ตั้ง timeout 2 วิ เพื่อไม่ให้บล็อกตลอด
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
-        ts.tv_sec += 2; // ให้รอสูงสุด 2 วิ ต่อรอบ
+        ts.tv_sec += 2;
 
-        // mq_timedreceive():
-        //   - รอรับข้อความจาก client_q
-        //   - ถ้ามีข้อความ: return จำนวน byte > 0
-        //   - ถ้า timeout: return -1
-        ssize_t n = mq_timedreceive(client_q, buf, sizeof(buf), nullptr, &ts); 
-
+        // รอรับข้อความจาก server สูงสุด 2 วิ
+        ssize_t n = mq_timedreceive(client_q, buf, sizeof(buf), nullptr, &ts);
         if (n > 0)
         {
-            buf[n] = '\0'; // เติม '\0' เพื่อให้ buf เป็น string ปลอดภัย
-
-            // แสดงข้อความที่ได้รับ:
-            // - เป็นสีเหลืองเพื่อบอกว่านี่คือข้อความจากระบบ/คนอื่น
-            // - แล้วพิมพ์ prompt "> " สีเขียวต่อท้าย
-            std::cout
-                << "\n" << ANSI_COLOR_YELLOW << buf << ANSI_COLOR_RESET
-                << "\n" << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET
-                << std::flush;
+            buf[n] = '\0';
+            // ขึ้นบรรทัดใหม่แล้วแสดงข้อความจาก server
+            std::cout << "\n"
+                      << ANSI_COLOR_YELLOW << buf << ANSI_COLOR_RESET << "\n"
+                      << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
         }
-        // ถ้า n <= 0 แปลว่า timeout หรือ error เล็ก ๆ -> วนใหม่
-        // ตรงนี้จะเช็ค keep_running อีกรอบใน while
+        // ถ้า timeout ก็วนใหม่ แล้วไปเช็ค keep_running ที่ while
     }
 
-    // ปิดคิวของเราก่อนจบ thread
     mq_close(client_q);
 }
 
+
 ```
-พาร์ทที่ 2: ส่วนเริ่มต้นการทำงานของ client (ส่วนต้นของ main(): ตรวจ argv, ลงทะเบียนกับ server, สร้าง threads)
-
-1.ตรวจว่าผู้ใช้ใส่ชื่อ client มาหรือยัง (เช่น ./client alice)
-
-2.กำหนดชื่อคิวส่วนตัวของ client (/client_alice)
-
-3.สร้าง thread listen_queue() เพื่อรอรับข้อความจากเซิร์ฟเวอร์
-
-4.เปิดคิว /server เพื่อส่งคำสั่งขึ้นไปหาเซิร์ฟเวอร์
-
-5.ส่งข้อความ REGISTER:/client_alice เพื่อประกาศตัวตนกับ server
-
-6.สร้าง thread heartbeat_sender() เพื่อส่ง PING ตลอดเวลา
-
-7.เตรียมฟังก์ชัน confirm_action() ไว้ใช้ยืนยันก่อน LEAVE/QUIT
-
+พาร์ทที่ 2: main: การเริ่มต้น, วงวนคำสั่ง, และปิดโปรแกรม : ส่วนหลักสุดของ client ที่บอกลำดับ “ชีวิตของ client” ตั้งแต่เริ่มจนจบ
 
 ```cpp
-// เปิด /server, ลงทะเบียน, วนอ่านคำสั่งจากผู้ใช้ แล้วส่งต่อไป server
-// คำสั่งฝั่ง client: SAY/DM/JOIN/WHO/LEAVE/QUIT
 int main(int argc, char *argv[])
 {
-    // ต้องมีชื่อ client ตอนรันโปรแกรม เช่น ./client alice
-    // ถ้าไม่มีก็แจ้งวิธีใช้แล้วจบ
+    // 1) ต้องมีชื่อ client ตอนรัน เช่น ./client alice
     if (argc < 2)
     {
-        std::cerr << "USAGE!!!    --->    ./client [client_name]" << std::endl;
+        std::cerr << "+++++ USAGE: ./<client_file> <client_name> +++++" << std::endl;
         return 1;
     }
 
-    // เก็บชื่อผู้ใช้ และตั้งชื่อคิวส่วนตัวของ client
-    // เช่น client_name = "alice"
-    //      client_qname = "/client_alice"
-    std::string client_name  = argv[1];
-    std::string client_qname = "/client_" + client_name;
+    // 2) ตั้งชื่อสำคัญ ๆ ของ client
+    std::string client_name  = argv[1];                  // ชื่อเรา
+    std::string client_qname = "/client_" + client_name; // คิวที่ server จะใช้ส่งมาหาเรา
+    std::string current_room = "";                       // จะอัปเดตตอน JOIN
 
-    // เก็บว่าตอนนี้เราอยู่ในห้องไหน (string ว่าง = ยังไม่ join ห้องใด)
-    std::string current_room = "";
+    // 3) สตาร์ท thread ฟังข้อความจาก server ก่อนเลย
+    std::thread listener_thread(listen_queue, client_qname);
 
-    // สร้าง thread "ฟังข้อความ" จาก server
-    // listen_queue() จะเปิดคิว /client_<name> แล้วรอรับข้อความ
-    std::thread t(listen_queue, client_qname);
-    // เราไม่ detach ที่นี่ เพราะตอนจบเราจะ join() เพื่อปิดเรียบร้อย
-
-    // เปิดคิวกลางของ server เพื่อจะส่งคำสั่งขึ้นไปหาเซิร์ฟเวอร์
+    // 4) เปิดคิวของ server สำหรับ "ส่ง" ข้อความขึ้นไป
     mqd_t server_q = mq_open("/server", O_WRONLY);
 
-    // ส่งข้อความ REGISTER เพื่อบอก server ว่า client คนนี้เข้ามาแล้ว
-    // ตัวอย่าง: "REGISTER:/client_alice"
+    // 5) ส่ง REGISTER ให้ server รู้ว่าเรามีคิวชื่ออะไร
     std::string reg_msg = "REGISTER:" + client_qname;
     mq_send(server_q, reg_msg.c_str(), reg_msg.size() + 1, 0);
 
-    // บอกผู้ใช้ว่าเรา register สำเร็จ และโชว์ prompt สีเขียว
-    std::cout << "Registered as " << client_name << "\n" 
-              << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
+    // 6) สตาร์ท heartbeat thread ให้ ping ไปเรื่อย ๆ
+    std::thread heartbeat_thread(heartbeat_sender, client_name, "/server");
 
-    // สร้าง thread heartbeat เพื่อส่ง "PING:<client_name>" เป็นระยะ
-    std::thread pinger(heartbeat_sender, client_name, "/server");
+    // 7) แสดงเมนู + บอกชื่อที่ register แล้ว
+    system("clear");
+    std::cout << std::endl;
+    innitial_commands();
+    std::cout << std::endl;
+    std::cout << "REGISTERED AS " << client_name << std::endl;
+    std::cout << std::endl;
+    std::cout << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
 
-    // ฟังก์ชันยืนยันการทำ action สำคัญ เช่น LEAVE และ QUIT
-    // จะถามผู้ใช้ (y/n) เพื่อกันกดผิด
-    auto confirm_action = [](const std::string& action) -> bool {
-        std::cout << ANSI_COLOR_YELLOW
-                  << "Are you sure you want to " << action << "? (y/n): "
-                  << ANSI_COLOR_RESET;
-        std::string confirm_line;
-        std::getline(std::cin, confirm_line);
-        if (confirm_line == "y" || confirm_line == "Y") {
-            return true;
+    // 8) วงวนหลัก: รอผู้ใช้พิมพ์คำสั่ง
+    std::string msg;
+    while (std::getline(std::cin, msg))
+    {
+        // ---- SAY ----
+        if (msg.rfind("SAY:", 0) == 0)
+        {
+            std::string send_msg = "SAY:[" + client_name + "]: " + msg.substr(4);
+            mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0);
         }
-        std::cout << "Action cancelled." << std::endl;
-        return false;
-    };
+        // ---- JOIN ----
+        else if (msg.rfind("JOIN:", 0) == 0)
+        {
+            current_room = msg.substr(5);
+            std::string send_msg = "JOIN:" + client_name + ": " + current_room;
+            mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0);
+            system("clear");
+            std::cout << "Joined #" << current_room << " successfully" << std::endl;
+        }
+        // ---- DM ----
+        else if (msg.rfind("DM:", 0) == 0)
+        {
+            size_t pos = msg.find(':', 3);
+            if (pos == std::string::npos)
+            {
+                std::cout << "Invalid DM format. Use: DM:<target>:<message>\n> ";
+                continue;
+            }
+
+            std::string target = msg.substr(3, pos - 3);
+            std::string text   = msg.substr(pos + 1);
+            std::string send_msg = "DM:" + client_name + ":" + target + ":" + text;
+            mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0);
+        }
+        // ---- WHO ----
+        else if (msg.rfind("WHO:", 0) == 0)
+        {
+            std::string send_msg = "WHO:" + client_name + ">" + current_room;
+            mq_send(server_q, send_msg.c_str(), send_msg.size() + 1, 0);
+        }
+        // ---- LEAVE ----
+        else if (msg.rfind("LEAVE:", 0) == 0)
+        {
+            if (current_room.empty())
+            {
+                std::cout << "You are not in any room." << std::endl;
+            }
+            else if (confirm_action("leave room #" + current_room))
+            {
+                system("clear");
+                std::cout << "You left room #" << current_room << std::endl;
+                innitial_commands();
+                current_room.clear();
+
+                std::string payload = "LEAVE:" + client_name;
+                mq_send(server_q, payload.c_str(), payload.size() + 1, 0);
+            }
+        }
+        // ---- QUIT ----
+        else if (msg.rfind("QUIT:", 0) == 0)
+        {
+            // ถ้าไม่ยืนยันก็วนต่อ
+            if (!confirm_action("quit the server"))
+            {
+                std::cout << "> ";
+                continue;
+            }
+
+            // ถ้ายังอยู่ในห้องอยู่ ให้แจ้ง LEAVE ก่อนค่อย QUIT
+            if (!current_room.empty())
+            {
+                std::string payload_leave = "LEAVE:" + client_name;
+                mq_send(server_q, payload_leave.c_str(), payload_leave.size() + 1, 0);
+                std::cout << "You left room before quitting." << std::endl;
+                current_room.clear();
+            }
+
+            // ตอนนี้ค่อยส่ง QUIT
+            std::string payload_quit = "QUIT:" + client_name;
+            mq_send(server_q, payload_quit.c_str(), payload_quit.size() + 1, 0);
+
+            // บอก thread อื่น ๆ ให้หยุด
+            keep_running = false;
+            break;
+        }
+        // ---- Unknown ----
+        else if (!msg.empty())
+        {
+            std::cout << "Command not found." << std::endl;
+        }
+
+        // แสดง prompt ใหม่
+        std::cout << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
+    }
+
+    // 9) cleanup ตอนจบโปรแกรม
+    mq_close(server_q);                 // ปิดคิวส่ง
+    listener_thread.join();             // รอ thread ฟังข้อความจบ
+    heartbeat_thread.join();            // รอ thread heartbeat จบ
+    mq_unlink(client_qname.c_str());    // ลบคิวของเราออกจากระบบ
+    return 0;
+}
 
 
 ```
@@ -1029,6 +1101,18 @@ break ออกจากลูป แล้ว clean up ทุกอย่าง
 
 ```
 
+สรุปรายงานภาพรวมของโปรแกรม Client
+
+โปรแกรม Client มีหน้าที่เป็นตัวกลางระหว่างผู้ใช้งานกับ Server เพื่อสื่อสารกันผ่านระบบ POSIX Message Queue (MQ) โดยผู้ใช้สามารถพิมพ์คำสั่งต่าง ๆ เพื่อเข้าห้อง พูดคุย ส่งข้อความส่วนตัว ดูรายชื่อสมาชิก หรือออกจากระบบได้ โปรแกรมนี้ใช้หลักการทำงานแบบ หลายเธรด (Multithreading) เพื่อให้สามารถทำงานหลายอย่างพร้อมกัน ได้แก่
+
+Main Thread สำหรับรับคำสั่งจากผู้ใช้และส่งไปยัง Server
+
+Listener Thread สำหรับรอรับข้อความจาก Server แล้วแสดงผลทันที
+
+Heartbeat Thread สำหรับส่งสัญญาณ “PING” ไปยัง Server เป็นระยะ เพื่อบอกว่าผู้ใช้งานยังออนไลน์อยู่
+
+การทำงานทั้งหมดถูกควบคุมด้วยตัวแปร keep_running เพื่อให้ทุกเธรดหยุดพร้อมกันเมื่อผู้ใช้สั่ง QUIT:.
+ด้วยโครงสร้างแบบนี้ โปรแกรม Client สามารถทำงานแบบ Asynchronous Communication คือ การสื่อสารที่ไม่ต้องรอให้แต่ละฝ่ายทำงานเสร็จทีละขั้นตอนก่อนถึงจะดำเนินต่อได้
 
 
 
