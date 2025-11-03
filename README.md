@@ -14,207 +14,553 @@ Server
 การแบ่งระบบออกเป็น 2 พาร์ทนี้ ช่วยให้โครงสร้างการทำงานของ Server มีความยืดหยุ่น และสามารถรองรับผู้ใช้จำนวนมากพร้อมกันได้ โดยไม่ทำให้ระบบล่าช้าหรือค้างระหว่างการส่งข้อมูล เนื่องจากส่วน Main System จะทำหน้าที่รับคำสั่งและควบคุมการทำงานหลัก ส่วน Broadcast System จะรับหน้าที่ส่งข้อความแบบขนาน จึงทำให้การประมวลผลและการสื่อสารเกิดขึ้นได้พร้อมกัน
 
 ---
-องค์ประกอบหลักของสถานะระบบ:
+พาร์ทที่ 1 ส่วนประกาศ header, struct, และ utility : เซิร์ฟเวอร์ “ไม่ได้ส่งให้ client ตรง ๆ ทันที” แต่จะสร้าง BroadcastTask แล้วโยนเข้า broadcast_queue เพื่อให้ worker thread ไปส่งทีหลัง → ทำให้ main thread ไม่ค้าง
+ใช้ RW-lock เพราะรายการสมาชิกห้องถูก “อ่าน” บ่อยกว่าถูก “เขียน”
 ```cpp
-// เก็บสมาชิกปัจจุบันในแต่ละห้อง
-std::map<std::string, std::vector<std::string>> room_members = {
-    {"room1", {}},
-    {"room2", {}},
-    {"room3", {}}
-};
 
-// mutex แบบอ่าน/เขียนสำหรับป้องกันการแก้ข้อมูลห้องพร้อมกันหลายเธรด
-pthread_rwlock_t registry_lock;
-
-// เก็บรายชื่อคิวของ client ทั้งหมด (เช่น "/client_alice", "/client_bob")
-std::vector<std::string> client_queues;
-
-// เก็บ timestamp ล่าสุดที่ client ส่ง heartbeat (PING)
-std::map<std::string, std::chrono::steady_clock::time_point> client_heartbeats;
-std::mutex heartbeat_mutex;
-
-```
----
-พาร์ท Broadcast System เป็นส่วนที่ทำหน้าที่กระจายข้อความจากผู้ใช้หนึ่งคนไปยังผู้ใช้คนอื่น ๆ ภายในห้องแชทเดียวกัน (chat room) ให้เกิดขึ้นอย่างรวดเร็วและไม่รบกวนการทำงานของส่วนหลักของเซิร์ฟเวอร์
-
-กระบวนการทำงานเริ่มจาก เมื่อมีข้อความหรือเหตุการณ์ใหม่เกิดขึ้น เช่น ผู้ใช้ส่งข้อความ (SAY) เข้าห้อง หรือมีการเข้าห้อง (JOIN) / ออกจากห้อง (LEAVE) ฟังก์ชันในพาร์ท Main System จะสร้างวัตถุ (object) ชื่อ BroadcastTask ขึ้นมา ซึ่งภายในจะบันทึกข้อมูลสำคัญ ได้แก่ message_payload คือเนื้อหาของข้อความที่ต้องส่ง, sender_name คือชื่อผู้ส่ง, target_room คือชื่อห้องที่จะส่งข้อความไป
-
-จากนั้นงานนี้จะถูกส่งเข้ามาเก็บในคิวกลางชื่อว่า broadcast_queue ซึ่งเป็นคิวชนิดพิเศษที่ออกแบบให้ ปลอดภัยต่อการเข้าถึงพร้อมกันหลายเธรด (thread-safe) โดยคิวนี้มีฟังก์ชันหลักคือ push() สำหรับใส่งานเข้า และ pop() สำหรับดึงงานออกมาใช้งาน
-
-เมื่อมีงานใหม่ถูกส่งเข้าคิวแล้ว เธรดในส่วน Broadcaster ซึ่งทำงานอยู่ตลอดเวลาจะเป็นผู้มาดึงงานนั้นออกไปประมวลผล ฟังก์ชันที่ทำหน้าที่นี้คือ broadcaster_worker()
-
-โครงสร้างงาน Broadcast:
-```cpp
+// งาน 1 ชิ้นที่ต้องกระจายออกไปให้สมาชิกในห้อง
 struct BroadcastTask
 {
-    std::string message_payload; // เนื้อความที่จะส่ง เช่น "[alice]: hi" หรือ "[SYSTEM]: bob has left #room1"
-    std::string sender_name;     // ใช้เพื่อไม่ส่งข้อความซ้ำกลับไปที่คนส่งเอง
-    std::string target_room;     // ห้องเป้าหมาย (อาจว่างถ้าเป็นข้อความพูดปกติ แล้วต้องเดาห้องจาก sender)
+    std::string message_payload; // ข้อความที่จะส่งจริง เช่น "[SYSTEM]: A joined #room1"
+    std::string sender_name;     // ใครเป็นคนส่ง (ใช้กันส่งกลับให้ตัวเอง)
+    std::string target_room;     // ถ้าระบุ แปลว่าต้องส่งให้ห้องนี้เลย
 };
 
-```
-ระบบ Broadcast (การกระจายข้อความแบบขนาน)
-
-ข้อความทุกอันในห้อง (รวมถึงประกาศระบบ เช่น "Alice has joined") จะไม่ถูกส่งออกโดย main thread โดยตรง
-แต่ถูกแปลงเป็น “งาน” (task) แล้วใส่ลงในคิวกลาง จากนั้นมี worker threads หลายตัวทำหน้าที่กระจายข้อความออกไปยัง clientที่เกี่ยวข้อง
-
-คิวงาน Thread-safe:
-
-```cpp
-// TaskQueue<T> คือคิวงานที่ออกแบบมาให้ใช้ข้ามเธรดได้อย่างปลอดภัย (thread-safe)
-// ใช้ pattern แบบ Producer-Consumer:
-//   - ฝั่ง Producer เรียก push() ใส่งานเข้าคิว
-//   - ฝั่ง Consumer (เช่น worker thread) เรียก pop() ดึงงานออกมาทำ
-// จุดสำคัญคือเราป้องกัน race ด้วย mutex และใช้ condition_variable
-// เพื่อให้ consumer "รออย่างถูกต้อง" จนกว่าจะมีงาน ไม่ใช่ลูปเช็คตลอด (ไม่ busy-wait)
-
+// คิวงานแบบปลอดภัยสำหรับหลายเธรด (Producer-Consumer)
 template <typename T>
 class TaskQueue
 {
 public:
-    // push(item):
-    //   - ใช้โดยฝั่ง Producer
-    //   - ใส่งานใหม่ (item) เข้าไปในคิว
-    //   - จากนั้นปลุก 1 เธรดที่กำลังรอ pop() อยู่ ให้ตื่นมาทำงาน
-    void push(T item) {
-        std::unique_lock<std::mutex> lock(mtx); // ล็อกคิวกันหลายเธรดเขียนพร้อมกัน
-        queue.push(item);                       // ใส่ task เข้าไปท้ายคิว
-        lock.unlock();                          // ปลดล็อกก่อนปลุก เพื่อให้ consumer จับล็อกต่อได้เร็ว
-        cv.notify_one();                        // ปลุกหนึ่งเธรดที่กำลังรอ pop()
+    void push(T item)
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        queue.push(item);
+        lock.unlock();
+        cv.notify_one();              // ปลุก worker ที่กำลังรอ pop()
     }
 
-    // pop():
-    //   - ใช้โดยฝั่ง Consumer (เช่น broadcaster_worker)
-    //   - ถ้าไม่มีงานในคิว ให้รอ (block) จนกว่าจะมีใคร push งานเข้ามา
-    //   - เมื่อมีงานแล้ว จะดึงงานตัวแรกออก (FIFO)
-    T pop() {
-        std::unique_lock<std::mutex> lock(mtx); // จับล็อกก่อนแตะต้องคิว
-        // รอจนกว่าจะมีอย่างน้อย 1 งานในคิว
-        // cv.wait(...) จะปลดล็อก mtx ชั่วคราวระหว่างรอ
-        // แล้วกลับมาล็อกให้ใหม่อัตโนมัติเมื่อถูกปลุก
-        cv.wait(lock, [this]{ return !queue.empty(); });
-
-        T item = queue.front(); // หยิบงานตัวหน้าสุดของคิว (FIFO)
-        queue.pop();            // เอางานนั้นออกจากคิว
-        return item;            // ส่งงานให้คนเรียกไปประมวลผลต่อ
+    T pop()
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        cv.wait(lock, [this]{ return !queue.empty(); }); // รอจนกว่าจะมีงาน
+        T item = queue.front();
+        queue.pop();
+        return item;
     }
 
 private:
-    std::queue<T> queue;            // โครงสร้างคิวจริง ๆ เก็บงานตามลำดับ
-    std::mutex mtx;                 // ป้องกันไม่ให้หลายเธรดแก้ queue พร้อมกัน
-    std::condition_variable cv;     // ตัวช่วยให้ consumer รอแบบ block จนกว่าจะมีงาน
+    std::queue<T> queue;
+    std::mutex mtx;
+    std::condition_variable cv;
 };
 
-// ในระบบเซิร์ฟเวอร์เราใช้ TaskQueue กับชนิด BroadcastTask
-// เพื่อให้ main thread "ใส่งานกระจายข้อความ" ลงคิว
-// แล้วให้ broadcaster_worker (หลายเธรด) มาดึงงานจากคิวนี้ไปส่งห้องแชท
-TaskQueue<BroadcastTask> broadcast_queue;
+// ตัวช่วยจับ rwlock แบบ RAII เพื่อให้เขียนโค้ดสั้นและปลอดภัย
+class WriteLock
+{
+public:
+    WriteLock(pthread_rwlock_t &lock) : _lock(lock) { pthread_rwlock_wrlock(&_lock); }
+    ~WriteLock() { pthread_rwlock_unlock(&_lock); }
+private:
+    pthread_rwlock_t &_lock;
+};
+
+class ReadLock
+{
+public:
+    ReadLock(pthread_rwlock_t &lock) : _lock(lock) { pthread_rwlock_rdlock(&_lock); }
+    ~ReadLock() { pthread_rwlock_unlock(&_lock); }
+private:
+    pthread_rwlock_t &_lock;
+};
+
 
 ```
+พาร์ทที่ 2 Global State : เก็บสถานะเซิร์ฟเวอร์ทั้งหมด ที่ทุกเธรดต้องใช้ร่วมกัน 
+
+room_members คือแหล่งจริงที่บอกว่า “ตอนนี้ใครอยู่ห้องไหน” → broadcaster ต้องอ่านจากตรงนี้
+
+heartbeat แยก mutex ของตัวเองออกมาเลย เพราะมันเป็นงานอีกชุดที่ไม่เกี่ยวกับ RW-lock ของห้อง
+```cpp
+
+// ตารางห้อง → รายชื่อสมาชิกในห้อง
+std::map<std::string, std::vector<std::string>> room_members = {
+    {"room1", {}}, {"room2", {}}, {"room3", {}}};
+
+// lock สำหรับป้องกันการแก้ไข room_members / client_queues พร้อมกันหลายเธรด
+pthread_rwlock_t registry_lock;
+
+// คิวกลางสำหรับงาน broadcast
+TaskQueue<BroadcastTask> broadcast_queue;
+
+// รายการชื่อคิวของ client ที่เคย REGISTER เข้ามา
+std::vector<std::string> client_queues;
+
+// เก็บเวลา heartbeat ล่าสุดของ client แต่ละคน
+std::map<std::string, std::chrono::steady_clock::time_point> client_heartbeats;
+std::mutex heartbeat_mutex;  // ป้องกัน map นี้โดยเฉพาะเพราะใช้บ่อย
+
+```
+พาร์ทที่ 3: ระบบ Heartbeat และการล้าง client : ให้เซิร์ฟเวอร์ “รู้ว่าใครยังมีชีวิตอยู่” และ “เอาคนที่หายไปนานออกให้”
+
+heartbeat_cleaner() — ฝั่งล้างศพ รันเป็น thread แยกตลอดเวลา 
+
+ทุก 15 วินาที เซิร์ฟเวอร์จะเช็ก client ทุกคน ถ้าไม่ส่ง heartbeat ภายใน 30 วินาที จะถือว่า “ตายแล้ว”
+
+ระบบจะเรียก handle_quit() แทนลูกค้า เพื่อเคลียร์ห้อง, broadcast ว่าคนนั้นออก, และลบ heartbeat เซิร์ฟเวอร์สามารถจัดการ client ที่ disconnect ไปเงียบ ๆ โดยอัตโนมัติ → ไม่มีผีค้างห้อง
+
+```cpp
+void handle_quit(const std::string &msg);  // ต้องประกาศก่อน เพราะ heartbeat_cleaner เรียกใช้
+
+// อัปเดตว่า client คนนี้เพิ่งส่ง PING มา
+void handle_ping(const std::string &msg)
+{
+    std::string client_name = msg.substr(5); // ตัด "PING:"
+    std::lock_guard<std::mutex> lock(heartbeat_mutex);
+    client_heartbeats[client_name] = std::chrono::steady_clock::now();
+}
+
+// เธรดนี้จะคอยตรวจทุก 15 วิ ว่ามี client ไหนไม่ส่ง PING เกิน 30 วิไหม
+void heartbeat_cleaner()
+{
+    while (true)
+    {
+        std::this_thread::sleep_for(std::chrono::seconds(15));
+
+        std::vector<std::string> dead_clients;
+        auto now = std::chrono::steady_clock::now();
+        const int TIMEOUT_SECONDS = 30;
+
+        // หา client ที่ตาย
+        {
+            std::lock_guard<std::mutex> lock(heartbeat_mutex);
+            for (const auto &pair : client_heartbeats)
+            {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - pair.second).count();
+                if (elapsed > TIMEOUT_SECONDS)
+                    dead_clients.push_back(pair.first);
+            }
+        }
+
+        // เคลียร์ client ที่ตายแล้ว ออกจากระบบเหมือน QUIT
+        for (const std::string &client_name : dead_clients)
+        {
+            std::cout << "[SYSTEM] Heartbeat timeout for " << client_name << ". Cleaning up." << std::endl;
+            handle_quit("QUIT:" + client_name);
+
+            // แจ้ง main ผ่านคิว /server ด้วย เผื่อ logic อื่นต้องรู้
+            mqd_t server_q = mq_open("/server", O_WRONLY | O_NONBLOCK);
+            if (server_q != -1)
+            {
+                std::string quit_msg = "QUIT:" + client_name;
+                mq_send(server_q, quit_msg.c_str(), quit_msg.size() + 1, 0);
+                mq_close(server_q);
+            }
+        }
+    }
+}
+
+```
+
+พาร์ทที่ 4 กลุ่ม Handler สำหรับคำสั่งจาก client : แปลง “ข้อความที่ client ส่งมา” ให้กลายเป็นการอัปเดตสถานะ + ถ้าต้องกระจายก็โยนงานเข้า broadcast_queue
+
+ ได้เเก่ register, join, say, dm, who, leave, quit
+
+ ทุก handler “ไม่ส่งตรง” แต่สร้างงานแล้วโยนให้ Broadcast Worker → main thread เบา
+
+ ```cpp
+// client ใหม่ประกาศตัวเข้าระบบ
+void handle_register(const std::string &msg)
+{
+    std::string qname = msg.substr(9);   // "REGISTER:/client_x"
+    {
+        WriteLock lock(registry_lock);
+        client_queues.push_back(qname);
+    }
+
+    // เก็บเวลา heartbeat แรกให้เลย
+    std::string client_name = qname.substr(8); // ตัด "/client_"
+    {
+        std::lock_guard<std::mutex> lock(heartbeat_mutex);
+        client_heartbeats[client_name] = std::chrono::steady_clock::now();
+    }
+    std::cout << qname << " has joined the server!" << std::endl;
+}
+
+// client ขอเข้าห้อง / ย้ายห้อง
+void handle_join(const std::string &msg)
+{
+    WriteLock lock(registry_lock);
+
+    // format: "JOIN:alice: room1"
+    std::string payload = msg.substr(5);
+    size_t pos = payload.find(':');
+    if (pos == std::string::npos)
+        return;
+
+    std::string name = payload.substr(0, pos);
+    std::string room = payload.substr(pos + 2); // ข้าม ": "
+
+    // ถ้าห้องยังไม่มีให้สร้าง
+    if (!room_members.count(room))
+        room_members[room] = {};
+
+    // เอาออกจากทุกห้องก่อน (กันอยู่หลายห้อง)
+    for (auto &pair : room_members)
+    {
+        auto &members = pair.second;
+        members.erase(std::remove(members.begin(), members.end(), name), members.end());
+    }
+
+    // ใส่เข้าห้องเป้าหมาย
+    room_members[room].push_back(name);
+
+    // สร้างงาน broadcast แจ้งว่ามีคนเข้าห้อง
+    BroadcastTask task;
+    task.message_payload = "[SYSTEM]: " + name + " has joined #" + room;
+    task.sender_name = name;
+    task.target_room = room;
+    broadcast_queue.push(task);
+}
+
+// ส่งข้อความส่วนตัว
+void handle_dm(const std::string &msg)
+{
+    ReadLock lock(registry_lock);
+
+    // format: "DM:alice:bob:hello"
+    size_t first = msg.find(':', 3);
+    if (first == std::string::npos) return;
+
+    std::string rest = msg.substr(first + 1);
+    size_t second = rest.find(':');
+    if (second == std::string::npos) return;
+
+    std::string sender  = msg.substr(3, first - 3);
+    std::string target  = rest.substr(0, second);
+    std::string message = rest.substr(second + 1);
+
+    std::string qname = "/client_" + target;
+    mqd_t client_q = mq_open(qname.c_str(), O_WRONLY);
+
+    if (client_q == -1)
+    {
+        // ส่งกลับไปบอก sender ว่าไม่พบปลายทาง
+        std::string fail = "[Server]: user '" + target + "' not found.";
+        std::string sender_q = "/client_" + sender;
+        mqd_t s_q = mq_open(sender_q.c_str(), O_WRONLY);
+        if (s_q != -1)
+        {
+            mq_send(s_q, fail.c_str(), fail.size() + 1, 0);
+            mq_close(s_q);
+        }
+        return;
+    }
+
+    std::string full_msg = "[DM from " + sender + "]: " + message;
+    mq_send(client_q, full_msg.c_str(), full_msg.size() + 1, 0);
+    mq_close(client_q);
+
+    std::cout << sender << " → " << target << " : " << message << std::endl;
+}
+
+// ขอรายชื่อสมาชิกในห้อง
+void handle_who(const std::string &msg)
+{
+    ReadLock lock(registry_lock);
+
+    // format: "WHO:alice>room1"
+    size_t name_start = 4;
+    size_t end = msg.find('>', name_start);
+    if (end == std::string::npos) return;
+
+    std::string client_name = msg.substr(name_start, end - name_start);
+    std::string room        = msg.substr(end + 1);
+
+    std::string payload = "[Members in #" + room + "]: ";
+
+    if (room_members.count(room) && !room_members[room].empty())
+    {
+        for (size_t i = 0; i < room_members[room].size(); ++i)
+        {
+            payload += room_members[room][i];
+            if (i < room_members[room].size() - 1)
+                payload += ", ";
+        }
+    }
+    else
+    {
+        payload += "(empty)";
+    }
+
+    std::string qname = "/client_" + client_name;
+    mqd_t client_q = mq_open(qname.c_str(), O_WRONLY);
+    if (client_q == -1) return;
+
+    mq_send(client_q, payload.c_str(), payload.size() + 1, 0);
+    mq_close(client_q);
+}
+
+// ข้อความปกติในห้อง
+void handle_say(const std::string &msg)
+{
+    // msg: "SAY:[alice]: hello"
+    std::string payload = msg.substr(4);
+    size_t start = payload.find('[');
+    size_t end   = payload.find(']');
+    std::string sender = payload.substr(start + 1, end - start - 1);
+
+    BroadcastTask task;
+    task.message_payload = payload;
+    task.sender_name = sender;
+    task.target_room = "";  // ให้ worker หาห้องให้เองจาก sender
+    broadcast_queue.push(task);
+}
+
+// ออกจากห้อง
+void handle_leave(const std::string &msg)
+{
+    std::string client_name = msg.substr(6);
+    WriteLock lock(registry_lock);
+
+    for (auto &pair : room_members)
+    {
+        auto &members = pair.second;
+        auto it = std::remove(members.begin(), members.end(), client_name);
+        if (it != members.end())
+        {
+            members.erase(it, members.end());
+
+            BroadcastTask task;
+            task.message_payload = "[SYSTEM]: " + client_name + " has left #" + pair.first;
+            task.sender_name = client_name;
+            task.target_room = pair.first;
+            broadcast_queue.push(task);
+            break;
+        }
+    }
+}
+
+// ออกจากระบบทั้งหมด
+void handle_quit(const std::string &msg)
+{
+    // msg อาจเป็น "QUIT:alice" หรือ "QUIT:alice:leave_then_quit"
+    std::string rest = msg.substr(5);
+    std::string client_name;
+    std::string mode;
+
+    size_t colon = rest.find(':');
+    if (colon == std::string::npos)
+    {
+        client_name = rest;
+        mode = "quit";
+    }
+    else
+    {
+        client_name = rest.substr(0, colon);
+        mode = rest.substr(colon + 1);
+    }
+
+    std::string room_left;
+
+    {
+        WriteLock lock(registry_lock);
+        // เอา client ออกจากห้องก่อน
+        for (auto &pair : room_members)
+        {
+            auto &members = pair.second;
+            auto it = std::remove(members.begin(), members.end(), client_name);
+
+            if (it != members.end())
+            {
+                members.erase(it, members.end());
+                room_left = pair.first;
+                break;
+            }
+        }
+        // เอาออกจากลิสต์คิวด้วย
+        std::string qname = "/client_" + client_name;
+        client_queues.erase(std::remove(client_queues.begin(), client_queues.end(), qname), client_queues.end());
+    }
+
+    std::cout << client_name << " has quit the server." << std::endl;
+
+    // แจ้งห้องที่เหลือว่าคนนี้ออกแล้ว
+    if (!room_left.empty())
+    {
+        BroadcastTask quit_task;
+        quit_task.sender_name = client_name;
+        quit_task.message_payload = "[SYSTEM]: " + client_name + " has quit";
+        quit_task.target_room = room_left;
+        broadcast_queue.push(quit_task);
+    }
+
+    // ลบ heartbeat ออก
+    std::lock_guard<std::mutex> lock(heartbeat_mutex);
+    client_heartbeats.erase(client_name);
+}
+
+ ```
+---
+พาร์ท 5 Broadcast System : Broadcast System คือส่วนที่รับผิดชอบการ “กระจายข้อความ” ที่เกิดขึ้นในระบบแชท ไปยังผู้ใช้คนอื่น ๆ ที่อยู่ในห้องเดียวกัน โดยออกแบบให้แยกออกจากส่วนหลักของเซิร์ฟเวอร์ (ส่วนที่รอรับคำสั่งจาก client) เพื่อไม่ให้การส่งข้อความไปยังหลาย ๆ คนทำให้เซิร์ฟเวอร์หลักค้าง การออกแบบนี้ใช้แนวคิด Producer–Consumer: ส่วน main/handler จะเป็น Producer สร้าง “งานกระจายข้อความ” แล้วส่งเข้า คิวกลาง ส่วนกลุ่มเธรด Broadcaster จะเป็น Consumer คอยดึงงานออกมาส่งจริง
+
+   5.1 โครงสร้างงานกระจายข้อความ
+   
+   main/handler = producer → เรียก broadcast_queue.push(task);
+
+   broadcaster worker = consumer → เรียก broadcast_queue.pop();
+
+   ใช้ condition_variable → worker ไม่ต้องวนลูปเช็คตลอด (ไม่ busy-wait)
+ ```cpp
+struct BroadcastTask
+{
+    std::string message_payload; // เนื้อความที่จะส่ง เช่น "[alice]: hi" หรือ "[SYSTEM]: bob has left #room1"
+    std::string sender_name;     // ชื่อผู้ส่ง ใช้กันไม่ให้ส่งย้อนกลับไปหาคนส่ง
+    std::string target_room;     // ห้องเป้าหมาย ถ้าว่างแปลว่าต้องให้ worker เดาห้องจาก sender
+};
+```
+  5.2 คิวงานกลางแบบ Thread-safe
+
+```cpp
+// TaskQueue<T> = คิวงานข้ามเธรดแบบปลอดภัย
+// ใช้ร่วมกับ condition_variable เพื่อให้ worker รอแบบไม่เปลือง CPU
+template <typename T>
+class TaskQueue
+{
+public:
+    void push(T item)
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        queue.push(item);        // ใส่งานใหม่
+        lock.unlock();           // ปลดล็อกก่อนปลุก worker
+        cv.notify_one();         // ปลุก worker ให้มาหยิบงาน
+    }
+
+    T pop()
+    {
+        std::unique_lock<std::mutex> lock(mtx);
+        // ถ้ายังไม่มีงาน ให้รอจนกว่าจะมีคน push เข้ามา
+        cv.wait(lock, [this]{ return !queue.empty(); });
+        T item = queue.front();
+        queue.pop();
+        return item;
+    }
+
+private:
+    std::queue<T> queue;             // เก็บงานตามลำดับ FIFO
+    std::mutex mtx;                  // กันหลายเธรดแก้คิวพร้อมกัน
+    std::condition_variable cv;      // ให้ worker รอแบบบล็อกจนมีงาน
+};
+
+// คิวกลางจริงที่เซิร์ฟเวอร์ใช้
+TaskQueue<BroadcastTask> broadcast_queue;
+```
+   5.3 Worker กระจายข้อความ: worker ตัวนี้คือ ‘คนงาน’ จริงที่ทำให้ข้อความถูกส่งไปถึง client
 broadcast_queue เป็น สายพาน ที่ส่งงานกระจายข้อความจากส่วน Router → ไปยัง worker
 main server เป็น producer (เรียก push)
 worker เป็น consumer (เรียก pop)
-
-Worker ที่กระจายข้อความ:
 ```cpp
-// worker กระจายข้อความในห้อง (ไม่ส่งกลับให้ผู้ส่ง)
-// - หา room ของผู้ส่ง หรือใช้ target_room
-// - เดินรายชื่อสมาชิกแล้วส่งเข้าคิวของแต่ละคน
-// - ถ้าคิวปลายทางเต็ม ให้ข้าม/แจ้งเตือนแบบ best-effort
 void broadcaster_worker()
 {
     std::cout << "Broadcaster thread " << std::this_thread::get_id() << " started." << std::endl;
 
     while (true)
     {
+        // 1) รอหยิบงานจากคิว (บล็อกจนมีคน push)
         BroadcastTask task = broadcast_queue.pop();
         std::string room_to_broadcast;
 
-        // ถ้ามี target_room ระบุไว้ (เช่น system message JOIN/LEAVE)
-        if (!task.target_room.empty()) {
+        // 2) ถ้างานระบุห้องมาแล้ว ก็ใช้เลย → กรณี system event
+        if (!task.target_room.empty())
+        {
             room_to_broadcast = task.target_room;
-        } else {
-            // ถ้าเป็น SAY ปกติ → เดาว่าคนนี้อยู่ห้องไหน
+        }
+        else
+        {
+            // 3) ถ้าไม่ระบุห้อง แปลว่าเป็น SAY ปกติ → ต้องหาเองว่าคนนี้อยู่ห้องไหน
+            ReadLock lock(registry_lock);
+            for (const auto &pair : room_members)
             {
-                ReadLock lock(registry_lock);
-                for (const auto &pair : room_members) {
-                    const auto &members = pair.second;
-                    if (std::find(members.begin(), members.end(), task.sender_name) != members.end()) {
-                        room_to_broadcast = pair.first;
-                        break;
-                    }
+                const auto &members = pair.second;
+                if (std::find(members.begin(), members.end(), task.sender_name) != members.end())
+                {
+                    room_to_broadcast = pair.first;
+                    break;
                 }
             }
         }
 
-        if (room_to_broadcast.empty()) {
-            std::cout << "Broadcaster: No room found for task. (Sender: " << task.sender_name << ")" << std::endl;
+        // ถ้าหาห้องไม่เจอ ก็ข้ามงานนี้ไป
+        if (room_to_broadcast.empty())
             continue;
-        }
 
+        // 4) อ่านรายชื่อสมาชิกในห้อง แล้วส่งให้ทีละคน
+        ReadLock lock(registry_lock);
+
+        // เผื่อห้องโดนลบ/แก้ไขระหว่างรอ
+        if (room_members.find(room_to_broadcast) == room_members.end())
+            continue;
+
+        for (const auto &member : room_members.at(room_to_broadcast))
         {
-            ReadLock lock(registry_lock);
-
-            if (room_members.find(room_to_broadcast) == room_members.end())
+            // ไม่ต้องส่งกลับให้คนส่งเอง
+            if (member == task.sender_name)
                 continue;
 
-            for (const auto &member : room_members.at(room_to_broadcast)) {
+            std::string qname = "/client_" + member;
+            // เปิดคิวของ client ปลายทางแบบ non-blocking
+            mqd_t client_q = mq_open(qname.c_str(), O_WRONLY | O_NONBLOCK);
 
-                if (member == task.sender_name)
-                    continue; // ไม่ต้องส่งกลับให้ตัวส่งเอง
-
-                std::string qname = "/client_" + member;
-                mqd_t client_q = mq_open(qname.c_str(), O_WRONLY | O_NONBLOCK);
-
-                if (client_q != -1) {
-                    if (mq_send(client_q, task.message_payload.c_str(), task.message_payload.size() + 1, 0) == -1) {
-                        if (errno == EAGAIN) {
-                            // ถ้าคิวปลายทางเต็ม → แจ้งเตือนกลับไปหาคนส่ง
-                            std::string warning = "[Server]: Message to " + member + " dropped (queue full)";
-                            std::string sender_q = "/client_" + task.sender_name;
-                            mqd_t notify_q = mq_open(sender_q.c_str(), O_WRONLY | O_NONBLOCK);
-                            if (notify_q != -1) {
-                                mq_send(notify_q, warning.c_str(), warning.size() + 1, 0);
-                                mq_close(notify_q);
-                            }
-                        }
+            if (client_q != -1)
+            {
+                // ส่งข้อความ
+                if (mq_send(client_q, task.message_payload.c_str(), task.message_payload.size() + 1, 0) == -1)
+                {
+                    // ถ้าปลายทางคิวเต็ม อันนี้เป็นแบบ best-effort
+                    if (errno == EAGAIN)
+                    {
+                        // จะเพิ่ม logic แจ้งกลับคนส่งก็ได้ (ต้นฉบับคุณมีในเวอร์ชันก่อนหน้า)
                     }
-                    mq_close(client_q);
-                } else {
-                    std::cerr << "Broadcaster mq_open failed for " << member << std::endl;
                 }
+                mq_close(client_q);
+            }
+            else
+            {
+                std::cerr << "Broadcaster mq_open failed for " << member << std::endl;
             }
         }
     }
 }
 
-```
 
-การสร้าง worker หลายตัว (thread pool) 
-ใน main():
+```
+   5.4 การสร้าง Broadcaster Pool ใน main: ใน main() ของเซิร์ฟเวอร์จะสร้าง worker หลายตัวตั้งแต่เริ่มเลย เพื่อให้รองรับงานกระจายข้อความหลาย ๆ งานพร้อมกัน
+
+   ตรงนี้คือจุดที่ยืนยันว่าเซิร์ฟเวอร์ “ไม่ได้ส่งข้อความด้วยเธรดเดียว” แต่แบ่งงานออกไปให้หลายเธรดไปทำพร้อมกัน ทำให้เวลามีห้องใหญ่ ๆ หรือมี system event มาพร้อมกันหลายอัน เซิร์ฟเวอร์ยังตอบสนองต่อคำสั่งใหม่ได้ทัน เพราะ main ไม่ได้รอส่งข้อความเอง
 
 ```cpp
-int num_broadcasters = 4; // ค่า default = 4 thread
-const char *env_p = std::getenv("NUM_BROADCASTERS");
-if (env_p != nullptr) {
-    num_broadcasters = std::atoi(env_p);
-    if (num_broadcasters <= 0) num_broadcasters = 1;
-}
-const int NUM_BROADCASTERS = num_broadcasters;
-
-std::vector<std::thread> workers;
-for (int i = 0; i < NUM_BROADCASTERS; ++i)
+int main()
 {
-    workers.emplace_back(broadcaster_worker);
-    workers.back().detach();
+    pthread_rwlock_init(&registry_lock, NULL);
+
+    // Create broadcaster pool
+    int num_broadcasters = 32; // สร้าง worker 32 ตัวไว้เลย
+    for (int i = 0; i < num_broadcasters; ++i)
+        std::thread(broadcaster_worker).detach();
+    std::cout << "Broadcaster pool (size=" << num_broadcasters << ") started." << std::endl;
+
+    // ... โค้ดส่วนอื่น (heartbeat, รวมคิว /server, loop รับข้อความ) ...
 }
-std::cout << "Broadcaster pool (size=" << NUM_BROADCASTERS << ") started." << std::endl;
+
 
 
 ```
-เซิร์ฟเวอร์ไม่พึ่ง thread เดียวในการส่งข้อความออกไป มันสร้าง “Broadcaster Pool” หลายเธรด เพื่อรองรับโหลดสูง จำนวนเธรดปรับได้ผ่านตัวแปร environment NUM_BROADCASTERS
 
-การจัดการห้องและสมาชิก (JOIN / LEAVE / WHO)
+สรุปพาร์ท Broadcast System 
+
+Broadcast System ในโปรแกรมเซิร์ฟเวอร์นี้เป็นกลไกที่แยก “การรับคำสั่งจาก client” ออกจาก “การส่งข้อความไปยังทุกคนในห้อง” อย่างชัดเจน โดยใช้คิวงานส่วนกลาง (broadcast_queue) เป็นตัวกลางระหว่างส่วน Router/Handler กับกลุ่มเธรด Broadcaster วิธีนี้ทำให้ตัวเซิร์ฟเวอร์ไม่จำเป็นต้องส่งข้อความหาทุก client ด้วยตัวเองในเธรดหลัก ซึ่งจะทำให้เกิดการบล็อก แต่จะเปลี่ยนข้อความทุกชนิด (ทั้งข้อความที่ผู้ใช้พิมพ์ และข้อความระบบ เช่น JOIN/LEAVE/QUIT) ให้กลายเป็นงาน (task) แล้วให้เธรดเบื้องหลังเป็นผู้กระจายออกไปแทน ส่งผลให้ระบบสามารถรองรับผู้ใช้หลายคนและหลายห้องได้ดีขึ้น และยังขยายจำนวน worker ได้ง่ายในอนาคต
+
+---
+พาร์ท 6 การจัดการห้องและสมาชิก (JOIN / LEAVE / WHO)
 - JOIN (ย้ายเข้าห้อง)
 ```cpp
 /* JOIN
@@ -501,135 +847,60 @@ void handle_quit(const std::string &msg)
 }
 
 ```
+พาร์ทที่ 6: main() – การบูตเซิร์ฟเวอร์และลูปรับข้อความ : Main System หรือที่เรียกว่า Router System เป็นศูนย์กลางการควบคุมการทำงานของเซิร์ฟเวอร์ทั้งหมด มีหน้าที่รับข้อความจาก client ทุกคน ประมวลผลคำสั่ง และส่งต่อไปยังส่วนที่เกี่ยวข้อง เช่น Handler หรือ Broadcast System โดยทำงานแบบต่อเนื่องตลอดอายุการรันของโปรแกรม
 
-ระบบ Heartbeat และการตรวจจับ client ที่หลุด
+กระบวนการเริ่มต้นของ main()
 
-ปัญหาในระบบ chat จริง: client อาจ “ปิดโปรแกรมไปเฉย ๆ” โดยไม่ส่ง QUIT
-ถ้าไม่จัดการ เซิร์ฟเวอร์จะคิดว่าคนนั้นยังอยู่ในห้อง ซึ่งในโปรเเกรมนี้ป้องกันด้วย heartbeat ทำหน้าที่ อัปเดตเวลา “ลูกค้าคนนี้ยังหายใจอยู่” ทุกครั้งที่ client ส่ง PING:<name> มา
+เมื่อโปรแกรมเริ่มทำงาน ฟังก์ชัน main() จะทำหน้าที่เตรียมและเปิดระบบดังนี้
+
+1.กำหนดกลไกการล็อกข้อมูลร่วมกัน (RW Lock) ใช้ pthread_rwlock_init() เพื่อป้องกันการเข้าถึงข้อมูลห้อง (room_members) พร้อมกันจากหลาย thread
+
+2.สร้างกลุ่ม Broadcaster Workers สร้างเธรดหลายตัวด้วย std::thread(broadcaster_worker).detach() เพื่องานกระจายข้อความ (ดู พาร์ท Broadcast System) ซึ่งช่วยให้การส่งข้อความไม่ไปรบกวน main thread
+
+3.เริ่มต้น Heartbeat Cleaner Thread เธรดนี้เรียก heartbeat_cleaner() คอยตรวจสอบ client ที่ไม่ส่งสัญญาณ PING ภายในเวลาที่กำหนด หากหมดเวลา จะลบออกจากระบบโดยอัตโนมัติ
+
+4.เปิด Message Queue หลักของ Server ใช้ mq_open("/server", O_CREAT | O_RDWR, 0644, &attr) เพื่อสร้างและเปิด queue กลางชื่อ /server เป็นช่องทางรับข้อความจากทุก client
+
+5.เข้าสู่ลูปรับข้อความ (Main Loop) ใช้ mq_receive() รับข้อความจาก queue ของ client ทีละข้อความ จากนั้นตรวจสอบ prefix ของข้อความว่าเป็นคำสั่งใด เช่น REGISTER:, JOIN:, SAY: หรือ QUIT: แล้วส่งต่อไปยังฟังก์ชัน handler ที่เกี่ยวข้อง
+
+6.เชื่อมโยงกับระบบ Broadcast เมื่อ handler ใด (เช่น handle_join, handle_leave, handle_quit, หรือ handle_say) ตรวจพบเหตุการณ์ที่ต้องแจ้งต่อผู้อื่น จะสร้าง BroadcastTask ใหม่และใส่งานลงใน broadcast_queue เพื่อให้ broadcaster_worker() ทำการกระจายข้อความต่อ
+
+ดังนั้น Main System ทำหน้าที่ "สร้างและส่งงาน" ในขณะที่ Broadcast System ทำหน้าที่ "รับงานและกระจายต่อ"
+สองระบบนี้ทำงานควบคู่กันอย่างไม่บล็อกกัน (Asynchronous Communication) จึงทำให้เซิร์ฟเวอร์สามารถตอบสนองต่อผู้ใช้หลายคนพร้อมกันได้อย่างราบรื่น
+
 ```cpp
-// อัปเดต heartbeat ของผู้ใช้ (ยังออนไลน์)
-void handle_ping(const std::string &msg)
-{
-    std::string client_name = msg.substr(5); // "PING:<name>"
-    std::lock_guard<std::mutex> lock(heartbeat_mutex);
-    client_heartbeats[client_name] = std::chrono::steady_clock::now();
-}
-
-
-```
-
-heartbeat_cleaner() — ฝั่งล้างศพ รันเป็น thread แยกตลอดเวลา 
-
-ทุก 15 วินาที เซิร์ฟเวอร์จะเช็ก client ทุกคน
-
-ถ้าไม่ส่ง heartbeat ภายใน 30 วินาที จะถือว่า “ตายแล้ว”
-
-ระบบจะเรียก handle_quit() แทนลูกค้า เพื่อเคลียร์ห้อง, broadcast ว่าคนนั้นออก, และลบ heartbeat
-
-:เซิร์ฟเวอร์สามารถจัดการ client ที่ disconnect ไปเงียบ ๆ โดยอัตโนมัติ → ไม่มีผีค้างห้อง
-```cpp
-// เฝ้าดู heartbeat: ถ้าเงียบเกิน TIMEOUT -> cleanup/quit
-// รอบตรวจทุก SLEEP_SEC
-void heartbeat_cleaner()
-{
-    while (true)
-    {
-        std::this_thread::sleep_for(std::chrono::seconds(15));
-
-        std::vector<std::string> dead_clients;
-        auto now = std::chrono::steady_clock::now();
-        const int TIMEOUT_SECONDS = 30;
-
-        {
-            std::lock_guard<std::mutex> lock(heartbeat_mutex);
-            for (const auto &pair : client_heartbeats)
-            {
-                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - pair.second).count();
-                if (elapsed > TIMEOUT_SECONDS)
-                {
-                    dead_clients.push_back(pair.first);
-                }
-            }
-        }
-
-        for (const std::string &client_name : dead_clients)
-        {
-            std::cout << "[SYSTEM] Heartbeat timeout for " << client_name << ". Cleaning up." << std::endl;
-
-            // บังคับเหมือน user ส่ง QUIT เอง
-            handle_quit("QUIT:" + client_name);
-
-            // ส่งซ้ำเข้า /server (optional notify)
-            mqd_t server_q = mq_open("/server", O_WRONLY | O_NONBLOCK);
-            if (server_q != -1)
-            {
-                std::string quit_msg = "QUIT:" + client_name;
-                mq_send(server_q, quit_msg.c_str(), quit_msg.size() + 1, 0);
-                mq_close(server_q);
-            }
-        }
-    }
-}
-
-```
-
-Main Server Loop (Router หลัก)
-
-พาร์ท Main System หรือก็คือส่วนของ Router System เป็นส่วนหลักของเซิร์ฟเวอร์ที่ทำหน้าที่ “ควบคุมการไหลของข้อมูล” ระหว่าง client แต่ละคน และเป็นศูนย์กลางในการรับคำสั่งจากผู้ใช้ทุกคนในระบบ
-
-เมื่อเริ่มทำงาน ฟังก์ชัน main() จะเป็นจุดเริ่มต้นของโปรแกรมฝั่งเซิร์ฟเวอร์ โดย กำหนดค่าและเริ่มใช้งานล็อกกลาง (pthread_rwlock_init) เพื่อป้องกันการเข้าถึงข้อมูล room_members พร้อมกันจากหลายเธรด จากนั้น สร้างกลุ่มเธรด Broadcaster (เรียกใช้ broadcaster_worker()) เพื่อทำหน้าที่กระจายข้อความจากคิว broadcast_queue ซึ่งเป็นการเชื่อมโยงกับพาร์ท Broadcast System เเละทำการสร้างเธรดตรวจสอบการเชื่อมต่อ (Heartbeat Cleaner) โดยเรียก heartbeat_cleaner() เพื่อคอยตรวจสอบ client ที่ไม่ส่งสัญญาณ PING เกินเวลาที่กำหนด และสั่งลบออกจากระบบอัตโนมัติ เเละเปิด Message Queue /server ด้วย mq_open() เพื่อรอรับข้อความจาก client ตลอดเวลาการทำงานของเซิร์ฟเวอร์ หลังจากขั้นตอนการเตรียมระบบเสร็จแล้ว ฟังก์ชัน main() จะเข้าสู่ลูปหลักในการรอรับข้อความจาก client ด้วย mq_receive()
-
-ภายในลูปหลักของ main() เซิร์ฟเวอร์จะรับข้อความจาก message queue /server จากนั้นตรวจสอบว่าข้อความที่ได้รับขึ้นต้นด้วยคำสั่งประเภทใด (โดยดูจาก prefix ของ string เช่น "REGISTER:", "JOIN:", "SAY:" ) แล้วเรียกใช้ฟังก์ชันจัดการ (handler)
-
-เมื่อฟังก์ชันใด ๆ ในส่วน Main ตรวจพบว่ามีข้อความหรือเหตุการณ์ที่ต้องกระจายให้ผู้อื่นทราบ (เช่นจาก handle_join, handle_leave, handle_quit หรือข้อความ SAY: ใน main() เอง) ฟังก์ชันนั้นจะสร้าง BroadcastTask แล้วใส่งานลงใน broadcast_queue เพื่อให้ broadcaster_worker() จากพาร์ท Broadcast System เป็นผู้จัดการส่งข้อความต่อ
-
-ดังนั้น ส่วน Main จะทำหน้าที่ “สร้างและส่งงาน” ในขณะที่ส่วน Broadcast จะทำหน้าที่ “รับงานและกระจายต่อ”
-```cpp
-// เริ่มเธรด broadcaster + heartbeat, เปิดคิว /server และวนรับคำสั่ง
-// คำสั่งที่รับ: REGISTER/JOIN/SAY/DM/WHO/LEAVE/QUIT/PING
 int main()
 {
+    // 1) เตรียม rwlock
     pthread_rwlock_init(&registry_lock, NULL);
 
-    // 1) เริ่ม Broadcaster Worker Pool
-    int num_broadcasters = 4;
-    const char *env_p = std::getenv("NUM_BROADCASTERS");
-    if (env_p != nullptr)
-    {
-        num_broadcasters = std::atoi(env_p);
-        if (num_broadcasters <= 0) num_broadcasters = 1;
-    }
-    const int NUM_BROADCASTERS = num_broadcasters;
+    // 2) สร้าง worker กระจายข้อความหลาย ๆ ตัว
+    int num_broadcasters = 32; // จำนวน thread กระจายข้อความ
+    for (int i = 0; i < num_broadcasters; ++i)
+        std::thread(broadcaster_worker).detach();
+    std::cout << "Broadcaster pool (size=" << num_broadcasters << ") started." << std::endl;
 
-    std::vector<std::thread> workers;
-    for (int i = 0; i < NUM_BROADCASTERS; ++i)
-    {
-        workers.emplace_back(broadcaster_worker);
-        workers.back().detach();
-    }
-    std::cout << "Broadcaster pool (size=" << NUM_BROADCASTERS << ") started." << std::endl;
-
-    // 2) เริ่ม heartbeat cleaner
-    std::thread cleaner_thread(heartbeat_cleaner);
-    cleaner_thread.detach();
+    // 3) สร้าง thread สำหรับล้าง client ที่ไม่ส่ง heartbeat
+    std::thread(heartbeat_cleaner).detach();
     std::cout << "Heartbeat cleaner thread started." << std::endl;
 
-    // 3) เปิด message queue กลางของ server
+    // 4) ตั้งค่า message queue ของ server
     struct mq_attr attr;
     attr.mq_flags = 0;
-    attr.mq_maxmsg = 10;
+    attr.mq_maxmsg = 1000;   // รองรับโหลดเยอะหน่อย
     attr.mq_msgsize = 1024;
     attr.mq_curmsgs = 0;
 
+    // 5) เปิดคิว /server ไว้รอ client ส่งข้อความมา
     mqd_t server_q = mq_open("/server", O_CREAT | O_RDWR, 0644, &attr);
     if (server_q == -1)
     {
         perror("mq_open not complete");
         return 1;
     }
-    std::cout << "server opened" << std::endl;
+    std::cout << "Server opened." << std::endl;
 
-    // 4) วนรับคำสั่งตลอดเวลา
+    // 6) ลูปรอรับข้อความจากทุก client
     char buf[1024];
     while (true)
     {
@@ -639,38 +910,39 @@ int main()
             buf[n] = '\0';
             std::string msg(buf);
 
-            if      (msg.rfind("REGISTER:", 0) == 0) { handle_register(msg); }
-            else if (msg.rfind("JOIN:",     0) == 0) { handle_join(msg); }
-            else if (msg.rfind("SAY:",      0) == 0) {
-                std::string payload = msg.substr(4);
-                size_t start = payload.find('[');
-                size_t end   = payload.find(']');
-                std::string sender = payload.substr(start + 1, end - start - 1);
-
-                BroadcastTask task;
-                task.message_payload = payload;
-                task.sender_name = sender;
-                task.target_room = ""; // ให้ broadcaster_worker หาเองว่าห้องไหน
-                broadcast_queue.push(task);
-            }
-            else if (msg.rfind("DM:",       0) == 0) { handle_dm(msg); }
-            else if (msg.rfind("WHO:",      0) == 0) { handle_who(msg); }
-            else if (msg.rfind("LEAVE:",    0) == 0) { handle_leave(msg); }
-            else if (msg.rfind("QUIT:",     0) == 0) { handle_quit(msg); }
-            else if (msg.rfind("PING:",     0) == 0) { handle_ping(msg); }
-            else {
-                std::cout << "Unknown message: " << msg << std::endl;
-            }
+            // route ไปยัง handler ตาม prefix
+            if      (msg.rfind("REGISTER:", 0) == 0) handle_register(msg);
+            else if (msg.rfind("JOIN:",     0) == 0) handle_join(msg);
+            else if (msg.rfind("SAY:",      0) == 0) handle_say(msg);
+            else if (msg.rfind("DM:",       0) == 0) handle_dm(msg);
+            else if (msg.rfind("WHO:",      0) == 0) handle_who(msg);
+            else if (msg.rfind("LEAVE:",    0) == 0) handle_leave(msg);
+            else if (msg.rfind("QUIT:",     0) == 0) handle_quit(msg);
+            else if (msg.rfind("PING:",     0) == 0) handle_ping(msg);
+            else std::cout << "Unknown message: " << msg << std::endl;
         }
     }
 
+    // (โค้ดนี้จริง ๆ ไม่ถึงตรงนี้เพราะ while(true) แต่เขียนไว้ให้ครบ)
     mq_close(server_q);
     mq_unlink("/server");
     return 0;
 }
 
-```
 
+```
+---
+สรุป 
+
+เซิร์ฟเวอร์ตัวนี้แบ่งชัดเจนเป็น 3 ชั้นการทำงาน:
+
+ชั้นรับคำสั่ง (Input / Router): main อ่านจาก /server แล้วแยกไป handler
+
+ชั้นจัดการสถานะ (Handlers): ปรับข้อมูลห้อง, รายชื่อ client, สร้าง broadcast task
+
+ชั้นกระจายข้อความ (Broadcast Pool): worker หลายตัวดึงงานจากคิวแล้วส่งไปยังคิวของ client แต่ละคน
+
+และมี ระบบเฝ้าระวัง (Heartbeat Cleaner) แยกอีกตัวเพื่อเคลียร์ client ที่หลุด ทำให้สถานะบน server ไม่รก
 
 ---
 Client
