@@ -5,6 +5,8 @@
 #include <chrono>
 #include <time.h>
 #include <string>
+#include <map>
+#include <regex>
 
 // ============================================================
 //  GLOBAL VARIABLES AND CONSTANTS
@@ -43,19 +45,22 @@ void heartbeat_sender(const std::string &client_name, const std::string &server_
 
 void listen_queue(const std::string &qname)
 {
+    std::map<int, std::string> msg_buffer;
+    int expected_seq = 0;
+
     struct mq_attr attr;
     attr.mq_flags = 0;
     attr.mq_maxmsg = 10;
     attr.mq_msgsize = 1024;
     attr.mq_curmsgs = 0;
 
-    // เปิดคิวของ client เพื่อรอรับข้อความ
     mqd_t client_q = mq_open(qname.c_str(), O_CREAT | O_RDONLY, 0644, &attr);
-
     char buf[1024];
+
+    std::regex seq_pattern(R"(\[SEQ:(\d+)\])");
+
     while (keep_running)
     {
-        // รอสูงสุด 2 วิ แล้ววนใหม่ (เพื่อให้ thread ปิดได้เร็วเมื่อ quit)
         struct timespec ts;
         clock_gettime(CLOCK_REALTIME, &ts);
         ts.tv_sec += 2;
@@ -64,9 +69,38 @@ void listen_queue(const std::string &qname)
         if (n > 0)
         {
             buf[n] = '\0';
-            std::cout << "\n"
-                      << ANSI_COLOR_YELLOW << buf << ANSI_COLOR_RESET << "\n"
-                      << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
+            std::string msg(buf);
+
+            std::smatch match;
+            int seq = -1;
+            if (std::regex_search(msg, match, seq_pattern))
+                seq = std::stoi(match[1]);
+
+            if (seq != -1)
+            {
+                msg_buffer[seq] = msg;
+
+                // print messages in correct order
+                while (msg_buffer.count(expected_seq))
+                {
+                    std::cout << "\n"
+                              << ANSI_COLOR_YELLOW << msg_buffer[expected_seq]
+                              << ANSI_COLOR_RESET << "\n"
+                              << ANSI_COLOR_GREEN << "> "
+                              << ANSI_COLOR_RESET << std::flush;
+                    msg_buffer.erase(expected_seq);
+                    expected_seq++;
+                }
+            }
+            else
+            {
+                // fallback: messages without seq
+                std::cout << "\n"
+                          << ANSI_COLOR_YELLOW << msg
+                          << ANSI_COLOR_RESET << "\n"
+                          << ANSI_COLOR_GREEN << "> "
+                          << ANSI_COLOR_RESET << std::flush;
+            }
         }
     }
     mq_close(client_q);
