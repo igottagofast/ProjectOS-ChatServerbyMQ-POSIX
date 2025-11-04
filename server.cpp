@@ -17,6 +17,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
+#include <atomic>
 
 // ============================================================
 //  STRUCTS AND UTILITY CLASSES
@@ -24,6 +25,7 @@
 
 struct BroadcastTask
 {
+    int sequence_id;             // Task order
     std::string message_payload; // Content to broadcast
     std::string sender_name;     // Sender's name
     std::string target_room;     // Target room (optional)
@@ -91,6 +93,8 @@ std::vector<std::string> client_queues;
 std::map<std::string, std::chrono::steady_clock::time_point> client_heartbeats;
 std::mutex heartbeat_mutex;
 
+std::atomic<int> global_sequence_id(0);
+
 // ============================================================
 //  FUNCTION DECLARATIONS
 // ============================================================
@@ -112,11 +116,11 @@ void heartbeat_cleaner()
 {
     while (true)
     {
-        std::this_thread::sleep_for(std::chrono::seconds(15));
+        std::this_thread::sleep_for(std::chrono::seconds(3000));
 
         std::vector<std::string> dead_clients;
         auto now = std::chrono::steady_clock::now();
-        const int TIMEOUT_SECONDS = 30;
+        const int TIMEOUT_SECONDS = 600000000;
 
         {
             std::lock_guard<std::mutex> lock(heartbeat_mutex);
@@ -188,7 +192,8 @@ void handle_join(const std::string &msg)
     room_members[room].push_back(name);
 
     BroadcastTask task;
-    task.message_payload = "[SYSTEM]: " + name + " has joined #" + room;
+    task.sequence_id = global_sequence_id++;
+    task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] [SYSTEM]: " + name + " has joined #" + room; // ✅
     task.sender_name = name;
     task.target_room = room;
     broadcast_queue.push(task);
@@ -278,7 +283,8 @@ void handle_say(const std::string &msg)
     std::string sender = payload.substr(start + 1, end - start - 1);
 
     BroadcastTask task;
-    task.message_payload = payload;
+    task.sequence_id = global_sequence_id++;
+    task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] " + payload;
     task.sender_name = sender;
     task.target_room = "";
     broadcast_queue.push(task);
@@ -298,7 +304,8 @@ void handle_leave(const std::string &msg)
             members.erase(it, members.end());
 
             BroadcastTask task;
-            task.message_payload = "[SYSTEM]: " + client_name + " has left #" + pair.first;
+            task.sequence_id = global_sequence_id++;
+            task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] [SYSTEM]: " + client_name + " has left #" + pair.first;
             task.sender_name = client_name;
             task.target_room = pair.first;
             broadcast_queue.push(task);
@@ -350,8 +357,9 @@ void handle_quit(const std::string &msg)
     if (!room_left.empty())
     {
         BroadcastTask quit_task;
+        quit_task.sequence_id = global_sequence_id++;
         quit_task.sender_name = client_name;
-        quit_task.message_payload = "[SYSTEM]: " + client_name + " has quit";
+        quit_task.message_payload = "[SEQ:" + std::to_string(quit_task.sequence_id) + "] [SYSTEM]: " + client_name + " has quit";
         quit_task.target_room = room_left;
         broadcast_queue.push(quit_task);
     }
@@ -397,8 +405,8 @@ void broadcaster_worker()
         ReadLock lock(registry_lock);
         for (const auto &member : room_members.at(room_to_broadcast))
         {
-            if (member == task.sender_name)
-                continue;
+            // if (member == task.sender_name)
+            //     continue;
 
             std::string qname = "/client_" + member;
             mqd_t client_q = mq_open(qname.c_str(), O_WRONLY | O_NONBLOCK);
@@ -422,7 +430,7 @@ int main()
     pthread_rwlock_init(&registry_lock, NULL);
 
     // Create broadcaster pool
-    int num_broadcasters = 32; // initial thread number of workers
+    int num_broadcasters = 16; // initial thread number of workers
     for (int i = 0; i < num_broadcasters; ++i)
         std::thread(broadcaster_worker).detach();
     std::cout << "Broadcaster pool (size=" << num_broadcasters << ") started." << std::endl;
@@ -434,7 +442,7 @@ int main()
     // Server message queue setup
     struct mq_attr attr;
     attr.mq_flags = 0;
-    attr.mq_maxmsg = 1000;
+    attr.mq_maxmsg = 10;
     attr.mq_msgsize = 1024;
     attr.mq_curmsgs = 0;
 
