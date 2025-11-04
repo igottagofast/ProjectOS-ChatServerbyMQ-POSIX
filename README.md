@@ -1507,6 +1507,15 @@ QUIT:: ออกจากเซิร์ฟเวอร์
 
 Performance
 ---
+**Docker Setup and Compilation Guide**
+### 1️⃣ เตรียมเครื่อง
+- ติดตั้ง **Git**
+- ติดตั้ง **Docker Desktop**
+### 2️⃣ ดาวน์โหลดโค้ดจาก GitHub
+เปิด Terminal แล้วรัน:
+```bash
+cd ~/Desktop
+git clone https://github.com/igottagofast/oseiei.git
 
 
 
