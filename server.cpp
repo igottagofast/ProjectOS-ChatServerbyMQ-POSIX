@@ -405,8 +405,8 @@ void broadcaster_worker()
         ReadLock lock(registry_lock);
         for (const auto &member : room_members.at(room_to_broadcast))
         {
-            // if (member == task.sender_name)
-            //     continue;
+            if (member == task.sender_name)
+                 continue;
 
             std::string qname = "/client_" + member;
             mqd_t client_q = mq_open(qname.c_str(), O_WRONLY | O_NONBLOCK);
