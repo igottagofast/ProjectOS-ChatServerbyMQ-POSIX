@@ -1507,15 +1507,85 @@ QUIT:: ออกจากเซิร์ฟเวอร์
 
 Performance
 ---
-**Docker Setup and Compilation Guide**
-### 1️⃣ เตรียมเครื่อง
-- ติดตั้ง **Git**
-- ติดตั้ง **Docker Desktop**
-### 2️⃣ ดาวน์โหลดโค้ดจาก GitHub
-เปิด Terminal แล้วรัน:
-```bash
+**Docker and Compile**
+### Make a folder
+เปิด Terminal
+เข้า Desktop ด้วยคำสั่ง
+```cpp
 cd ~/Desktop
+```
+รันคำสั่งนี้
+```cpp
 git clone https://github.com/igottagofast/oseiei.git
-
-
-
+```
+จะได้โฟลเดอร์ชื่อ oseiei ขึ้นมาบน Desktop
+### Image and container build
+Docker image and container building
+เปิด Terminal แล้ว cd เข้าโฟลเดอร์ที่เพิ่งดาวน์โหลดมา จากนั้นรันคำสั่งนี้ใน Terminal เพื่อสร้าง image ที่ชื่อว่า serverchat
+```cpp
+docker build -t serverchat .
+```
+จากนั้นสร้าง container ที่ชื่อว่า serverchat_container จาก image serverchat ด้วยคำสั่งนี้
+```cpp
+docker run --name serverchat_container serverchat
+```
+จากนั้นรัน container ที่เพิ่งสร้างไปด้วยคำสั่งนี้
+```cpp
+docker start serverchat_container
+```
+---
+### Compile and run
+Compile server and client
+เข้าไปยัง container ที่อยู่ใน Docker ด้วยคำสั่ง
+```cpp
+docker exec -it serverchat_container bash
+```
+เมื่อเข้าไปได้แล้ว รันคำสั่งสำหรับการคอมไพล์ server
+```cpp
+g++ servertest.cpp -o server -pthread -lrt
+```
+แล้วคอมไพล์ของฝั่ง client ต่อ
+```cpp
+g++ client.cpp -o client -pthread -lrt
+```
+---
+### Run code
+เปิด Terminal แรก (สำหรับ server)
+เข้า container ด้วยคำสั่ง
+```cpp
+docker exec -it serverchat_container bash
+```
+แล้วรันตัว server ด้วยคำสั่ง
+```cpp
+./server
+```
+เปิด Terminal สอง (สำหรับ client1)
+เข้า container ด้วยคำสั่ง
+```cpp
+docker exec -it serverchat_container bash
+```
+แล้วรันตัว client ด้วยคำสั่ง
+```cpp
+./client <client_name>
+```
+เปิด Terminal สาม (สำหรับ client2)
+เข้า container ด้วยคำสั่ง
+```cpp
+docker exec -it serverchat_container bash
+```
+แล้วรันตัว client ด้วยคำสั่ง
+```cpp
+./client <client_name>
+```
+---
+### Test command examples
+เมื่อเข้าใช้งานได้แล้ว สามารถใช้คำสั่งเหล่านี้ได้ในฝั่ง client
+```cpp
+JOIN:room1
+SAY:hello
+DM:bob:hey there!
+WHO:
+LEAVE:
+QUIT:
+```
+---
