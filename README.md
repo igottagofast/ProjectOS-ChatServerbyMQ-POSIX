@@ -920,11 +920,13 @@ int main()
 หัวใจหลักของเซิร์ฟเวอร์คือการปกป้องข้อมูลทะเบียนผู้ใช้และสมาชิกห้อง (Registry) ซึ่งประกอบด้วย room_members และ client_queues ข้อมูลเหล่านี้มีลักษณะการใช้งานคือถูกอ่านบ่อย แต่ถูกเขียนนาน ๆ ครั้ง
 
     ระบบจึงเลือกใช้ pthread_rwlock_t (ผ่านคลาส ReadLock และ WriteLock) ซึ่งมีประสิทธิภาพสูงกว่า Mutex ธรรมดา
+    
     ReadLock: เมื่อ Thread ต้องการอ่านข้อมูล (เช่น handle_who, broadcaster_worker) มันจะใช้ ReadLock ซึ่งอนุญาตให้ Thread อื่น ๆ เข้ามาอ่านข้อมูลเดียวกันได้พร้อมกันหลาย Thread
     WriteLock: เมื่อ Thread ต้องการแก้ไขข้อมูล (เช่น handle_join, handle_leave, handle_quit) มันจะใช้ WriteLock ซึ่งเป็นการล็อคแบบพิเศษโดย Thread อื่น ๆ ทั้งหมด (ไม่ว่าจะอ่านหรือเขียน) จะต้องรอจนกว่าการเขียนจะเสร็จสิ้น
         
 1.2 Producer-Consumer Pattern (TaskQueue)
 สำหรับระบบ Broadcastเซิร์ฟเวอร์ใช้สถาปัตยกรรมแบบ Producer-Consumer โดยมี broadcast_queue ซึ่งเป็น TaskQueue ทำหน้าที่เป็นตัวกลาง
+
     Producers: Thread หลักที่รับคำสั่ง (เช่น handle_say, handle_join) ทำหน้าที่เป็นผู้ผลิต โดยจะ push() งาน (BroadcastTask) เข้าไปในคิว
     Consumers: Thread ในกลุ่ม broadcaster_worker (มี 16 ตัว) ทำหน้าที่เป็นผู้บริโภค โดยจะ pop() งานออกจากคิวไปทำ
         
@@ -932,6 +934,7 @@ int main()
 
 1.3 Mutex และ Atomic Variables
 สำหรับข้อมูลส่วนกลางอื่น ๆ ที่มีความซับซ้อนน้อยกว่า ระบบได้เลือกใช้กลไกที่จำเพาะเจาะจง
+
     std::mutex: heartbeat_mutex ถูกใช้เพื่อปกป้อง client_heartbeats ซึ่งเป็นการล็อคแบบ Exclusive ที่ตรงไปตรงมา เหมาะสำหรับการเข้าถึงทั้งอ่านและเขียนที่ไม่บ่อยเท่า Registry
     std::atomic: global_sequence_id ถูกใช้เป็นตัวนับ ID ของข้อความ การใช้ std::atomic<int> ทำให้การดำเนินการเพิ่มค่า (++) เป็นการดำเนินการที่รับประกันว่าจะเสร็จสิ้นในขั้นตอนเดียว (Atomic Operation) ซึ่งเร็วกว่าการใช้ Mutex มาก และเพียงพอสำหรับการนับเลข
 
@@ -1398,7 +1401,8 @@ Heartbeat Thread สำหรับส่งสัญญาณ PING ไปยั
 แล้ว client จัดการกับ Race Conditions อย่างไร
 ---
 2.1 การจัดการวงจรชีวิตของ Thread (std::atomic)
-ไคลเอ็นต์ใช้ std::atomic<bool> keep_running เป็นธงส่วนกลาง (Shared Flag) เพื่อควบคุมการทำงานของ listener_thread และ heartbeat_thread
+ไคลเอ็นต์ใช้ std::atomic<bool> keep_running เพื่อควบคุมการทำงานของ listener_thread และ heartbeat_thread
+
     Atomicity: การอ่านหรือเขียนค่า bool จะเกิดขึ้นในครั้งเดียว
     Visibility: นี่คือคุณสมบัติที่สำคัญที่สุด std::atomic รับประกันว่าเมื่อ Thread หลัก (Main) สั่ง QUIT: และเปลี่ยนค่า keep_running เป็น false, Thread อื่นๆ ที่กำลังวน Loop while(keep_running) อยู่ จะเห็นการเปลี่ยนแปลงค่านั้นทันที และหยุดการทำงานของตนเองได้อย่างถูกต้อง ป้องกันไม่ให้เกิด Thread ที่ค้างอยู่ในระบบ
         
