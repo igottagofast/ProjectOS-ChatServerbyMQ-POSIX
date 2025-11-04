@@ -192,8 +192,8 @@ void handle_join(const std::string &msg)
     room_members[room].push_back(name);
 
     BroadcastTask task;
-    task.sequence_id = global_sequence_id++;
-    task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] [SYSTEM]: " + name + " has joined #" + room; // ✅
+    task.sequence_id = ++global_sequence_id; // Use pre-increment to ensure atomic increment and fetch
+    task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] [SYSTEM]: " + name + " has joined #" + room;
     task.sender_name = name;
     task.target_room = room;
     broadcast_queue.push(task);
@@ -283,7 +283,7 @@ void handle_say(const std::string &msg)
     std::string sender = payload.substr(start + 1, end - start - 1);
 
     BroadcastTask task;
-    task.sequence_id = global_sequence_id++;
+    task.sequence_id = ++global_sequence_id; // Use pre-increment to ensure atomic increment and fetch
     task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] " + payload;
     task.sender_name = sender;
     task.target_room = "";
@@ -304,7 +304,7 @@ void handle_leave(const std::string &msg)
             members.erase(it, members.end());
 
             BroadcastTask task;
-            task.sequence_id = global_sequence_id++;
+            task.sequence_id = ++global_sequence_id; // Use pre-increment to ensure atomic increment and fetch
             task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] [SYSTEM]: " + client_name + " has left #" + pair.first;
             task.sender_name = client_name;
             task.target_room = pair.first;
@@ -357,7 +357,7 @@ void handle_quit(const std::string &msg)
     if (!room_left.empty())
     {
         BroadcastTask quit_task;
-        quit_task.sequence_id = global_sequence_id++;
+        quit_task.sequence_id = ++global_sequence_id; // Use pre-increment to ensure atomic increment and fetch
         quit_task.sender_name = client_name;
         quit_task.message_payload = "[SEQ:" + std::to_string(quit_task.sequence_id) + "] [SYSTEM]: " + client_name + " has quit";
         quit_task.target_room = room_left;
