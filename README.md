@@ -16,6 +16,7 @@ Server
 // งาน 1 ชิ้นที่ต้องกระจายออกไปให้สมาชิกในห้อง
 struct BroadcastTask
 {
+    int sequence_id
     std::string message_payload; // ข้อความที่จะส่งจริง เช่น "[SYSTEM]: A joined #room1"
     std::string sender_name;     // ใครเป็นคนส่ง (ใช้กันส่งกลับให้ตัวเอง)
     std::string target_room;     // ถ้าระบุ แปลว่าต้องส่งให้ห้องนี้เลย
@@ -205,7 +206,8 @@ void handle_join(const std::string &msg)
 
     // สร้างงาน broadcast แจ้งว่ามีคนเข้าห้อง
     BroadcastTask task;
-    task.message_payload = "[SYSTEM]: " + name + " has joined #" + room;
+    task.sequence_id = ++global_sequence_id; // Use pre-increment to ensure atomic increment and fetch
+    task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] [SYSTEM]: " + name + " has joined #" + room;
     task.sender_name = name;
     task.target_room = room;
     broadcast_queue.push(task);
@@ -299,9 +301,10 @@ void handle_say(const std::string &msg)
     std::string sender = payload.substr(start + 1, end - start - 1);
 
     BroadcastTask task;
-    task.message_payload = payload;
+    task.sequence_id = ++global_sequence_id; // Use pre-increment to ensure atomic increment and fetch
+    task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] " + payload;
     task.sender_name = sender;
-    task.target_room = "";  // ให้ worker หาห้องให้เองจาก sender
+    task.target_room = "";
     broadcast_queue.push(task);
 }
 
@@ -320,7 +323,8 @@ void handle_leave(const std::string &msg)
             members.erase(it, members.end());
 
             BroadcastTask task;
-            task.message_payload = "[SYSTEM]: " + client_name + " has left #" + pair.first;
+            task.sequence_id = ++global_sequence_id; // Use pre-increment to ensure atomic increment and fetch
+            task.message_payload = "[SEQ:" + std::to_string(task.sequence_id) + "] [SYSTEM]: " + client_name + " has left #" + pair.first;
             task.sender_name = client_name;
             task.target_room = pair.first;
             broadcast_queue.push(task);
@@ -377,8 +381,9 @@ void handle_quit(const std::string &msg)
     if (!room_left.empty())
     {
         BroadcastTask quit_task;
+        quit_task.sequence_id = ++global_sequence_id; // Use pre-increment to ensure atomic increment and fetch
         quit_task.sender_name = client_name;
-        quit_task.message_payload = "[SYSTEM]: " + client_name + " has quit";
+        quit_task.message_payload = "[SEQ:" + std::to_string(quit_task.sequence_id) + "] [SYSTEM]: " + client_name + " has quit";
         quit_task.target_room = room_left;
         broadcast_queue.push(quit_task);
     }
@@ -788,20 +793,8 @@ void broadcaster_worker()
 
             if (client_q != -1)
             {
-                // ส่งข้อความ
-                if (mq_send(client_q, task.message_payload.c_str(), task.message_payload.size() + 1, 0) == -1)
-                {
-                    // ถ้าปลายทางคิวเต็ม อันนี้เป็นแบบ best-effort
-                    if (errno == EAGAIN)
-                    {
-                        // จะเพิ่ม logic แจ้งกลับคนส่งก็ได้ (ต้นฉบับคุณมีในเวอร์ชันก่อนหน้า)
-                    }
-                }
-                mq_close(client_q);
-            }
-            else
-            {
-                std::cerr << "Broadcaster mq_open failed for " << member << std::endl;
+                mq_send(client_q, task.message_payload.c_str(), task.message_payload.size() + 1, 0);
+                mq_close(client_q);        
             }
         }
     }
@@ -819,16 +812,13 @@ int main()
     pthread_rwlock_init(&registry_lock, NULL);
 
     // Create broadcaster pool
-    int num_broadcasters = 32; // สร้าง worker 32 ตัวไว้เลย
+    int num_broadcasters = 16; // สร้าง worker 16 ตัวไว้เลย
     for (int i = 0; i < num_broadcasters; ++i)
         std::thread(broadcaster_worker).detach();
     std::cout << "Broadcaster pool (size=" << num_broadcasters << ") started." << std::endl;
 
     // ... โค้ดส่วนอื่น (heartbeat, รวมคิว /server, loop รับข้อความ) ...
 }
-
-
-
 ```
 
 สรุปพาร์ท Broadcast System 
@@ -859,7 +849,7 @@ int main()
     pthread_rwlock_init(&registry_lock, NULL);
 
     // 2) สร้าง worker กระจายข้อความหลาย ๆ ตัว
-    int num_broadcasters = 32; // จำนวน thread กระจายข้อความ
+    int num_broadcasters = 16; // จำนวน thread กระจายข้อความ
     for (int i = 0; i < num_broadcasters; ++i)
         std::thread(broadcaster_worker).detach();
     std::cout << "Broadcaster pool (size=" << num_broadcasters << ") started." << std::endl;
@@ -913,7 +903,6 @@ int main()
     return 0;
 }
 
-
 ```
 ---
 สรุป 
@@ -956,10 +945,6 @@ void heartbeat_sender(const std::string &client_name, const std::string &server_
 
         // เปิดคิวของ server ในโหมดเขียน (non-blocking เผื่อ server ไม่พร้อม)
         mqd_t server_q = mq_open(server_qname.c_str(), O_WRONLY | O_NONBLOCK);
-        if (server_q == -1) {
-            // เปิดไม่ได้ก็ปล่อยรอบนี้ไป
-            continue;
-        }
 
         // ส่ง ping เพื่อบอกว่าคลายเอนต์นี้ยังออนไลน์อยู่
         mq_send(server_q, ping_msg.c_str(), ping_msg.size() + 1, 0);
@@ -973,6 +958,9 @@ void heartbeat_sender(const std::string &client_name, const std::string &server_
 ```cpp
 void listen_queue(const std::string &qname)
 {
+    std::map<int, std::string> msg_buffer;
+    int expected_seq = 0;
+
     struct mq_attr attr;
     attr.mq_flags   = 0;
     attr.mq_maxmsg  = 10;
@@ -981,8 +969,9 @@ void listen_queue(const std::string &qname)
 
     // เปิดคิวของ client เพื่อรอข้อความที่ server ส่งมา
     mqd_t client_q = mq_open(qname.c_str(), O_CREAT | O_RDONLY, 0644, &attr);
-
     char buf[1024];
+
+    std::regex seq_pattern(R"(\[SEQ:(\d+)\])");
     while (keep_running)
     {
         // ตั้ง timeout 2 วิ เพื่อไม่ให้บล็อกตลอด
@@ -995,18 +984,55 @@ void listen_queue(const std::string &qname)
         if (n > 0)
         {
             buf[n] = '\0';
-            // ขึ้นบรรทัดใหม่แล้วแสดงข้อความจาก server
-            std::cout << "\n"
-                      << ANSI_COLOR_YELLOW << buf << ANSI_COLOR_RESET << "\n"
-                      << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
-        }
-        // ถ้า timeout ก็วนใหม่ แล้วไปเช็ค keep_running ที่ while
-    }
+            std::string msg(buf);
 
+            std::smatch match;
+            int seq = -1;
+            if (std::regex_search(msg, match, seq_pattern))
+                seq = std::stoi(match[1]);
+
+            if (seq != -1)
+            {
+                msg_buffer[seq] = msg;
+
+                // print messages in correct order
+                while (msg_buffer.count(expected_seq))
+                {
+                    std::cout << "\n"
+                              << ANSI_COLOR_YELLOW << msg_buffer[expected_seq]
+                              << ANSI_COLOR_RESET << "\n"
+                              << ANSI_COLOR_GREEN << "> "
+                              << ANSI_COLOR_RESET << std::flush;
+                    msg_buffer.erase(expected_seq);
+                    expected_seq++;
+                }
+            }
+            else
+            {
+                // fallback: messages without seq
+                std::cout << "\n"
+                          << ANSI_COLOR_YELLOW << msg
+                          << ANSI_COLOR_RESET << "\n"
+                          << ANSI_COLOR_GREEN << "> "
+                          << ANSI_COLOR_RESET << std::flush;
+            }
+        }
+    }
     mq_close(client_q);
 }
 
-
+void innitial_commands()
+{
+    std::cout << "+++++     commands for chat server    +++++" << std::endl;
+    std::cout << "===========================================" << std::endl;
+    std::cout << "===== JOIN  -- JOIN:<room_name>       =====" << std::endl;
+    std::cout << "===== SAY   -- SAY:<message>          =====" << std::endl;
+    std::cout << "===== DM    -- DM:<target>:<message>  =====" << std::endl;
+    std::cout << "===== WHO   -- WHO:                   =====" << std::endl;
+    std::cout << "===== LEAVE -- LEAVE:                 =====" << std::endl;
+    std::cout << "===== QUIT  -- QUIT:                  =====" << std::endl;
+    std::cout << "===========================================" << std::endl;
+}
 ```
 พาร์ทที่ 2: main: การเริ่มต้น, วงวนคำสั่ง, และปิดโปรแกรม: ส่วนหลักสุดของ client ที่บอกลำดับของ client ตั้งแต่เริ่มจนจบ
 
@@ -1025,7 +1051,7 @@ int main(int argc, char *argv[])
     std::string client_qname = "/client_" + client_name; // คิวที่ server จะใช้ส่งมาหาเรา
     std::string current_room = "";                       // จะอัปเดตตอน JOIN
 
-    // 3) สตาร์ท thread ฟังข้อความจาก server ก่อนเลย
+    // 3) เริ่ม thread ฟังข้อความจาก server ก่อนเลย
     std::thread listener_thread(listen_queue, client_qname);
 
     // 4) เปิดคิวของ server สำหรับ "ส่ง" ข้อความขึ้นไป
@@ -1035,7 +1061,7 @@ int main(int argc, char *argv[])
     std::string reg_msg = "REGISTER:" + client_qname;
     mq_send(server_q, reg_msg.c_str(), reg_msg.size() + 1, 0);
 
-    // 6) สตาร์ท heartbeat thread ให้ ping ไปเรื่อย ๆ
+    // 6) เริ่ม heartbeat thread ให้ ping ไปเรื่อย ๆ
     std::thread heartbeat_thread(heartbeat_sender, client_name, "/server");
 
     // 7) แสดงเมนู + บอกชื่อที่ register แล้ว
@@ -1047,7 +1073,7 @@ int main(int argc, char *argv[])
     std::cout << std::endl;
     std::cout << ANSI_COLOR_GREEN << "> " << ANSI_COLOR_RESET << std::flush;
 
-    // 8) วงวนหลัก: รอผู้ใช้พิมพ์คำสั่ง
+    // 8) วนรอผู้ใช้พิมพ์คำสั่ง
     std::string msg;
     while (std::getline(std::cin, msg))
     {
@@ -1152,7 +1178,7 @@ int main(int argc, char *argv[])
 
 
 ```
-พาร์ทที่ 3: วงวนหลักโต้ตอบกับผู้ใช้ และ cleanup
+พาร์ทที่ 3: Command Instruction วงวนหลักโต้ตอบกับผู้ใช้ และ cleanup
 อ่าน input จาก std::cin ทีละบรรทัด วิเคราะห์ prefix เพื่อดูว่าเป็นคำสั่งประเภทไหน แล้วแพ็กข้อความตามโปรโตคอล ก่อนส่งไป server ผ่านคิว /server
 
 คำสั่งหลัก:
@@ -1353,7 +1379,7 @@ Main Thread สำหรับรับคำสั่งจากผู้ใ�
 
 Listener Thread สำหรับรอรับข้อความจาก Server แล้วแสดงผลทันที
 
-Heartbeat Thread สำหรับส่งสัญญาณ “PING” ไปยัง Server เป็นระยะ เพื่อบอกว่าผู้ใช้งานยังออนไลน์อยู่
+Heartbeat Thread สำหรับส่งสัญญาณ PING ไปยัง Server เป็นระยะ เพื่อบอกว่าผู้ใช้งานยังออนไลน์อยู่
 
 การทำงานทั้งหมดถูกควบคุมด้วยตัวแปร keep_running เพื่อให้ทุกเธรดหยุดพร้อมกันเมื่อผู้ใช้สั่ง QUIT:.
 ด้วยโครงสร้างแบบนี้ โปรแกรม Client สามารถทำงานแบบ Asynchronous Communication คือ การสื่อสารที่ไม่ต้องรอให้แต่ละฝ่ายทำงานเสร็จทีละขั้นตอนก่อนถึงจะดำเนินต่อได้
