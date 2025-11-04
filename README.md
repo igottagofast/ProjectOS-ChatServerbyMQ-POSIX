@@ -1021,18 +1021,6 @@ void listen_queue(const std::string &qname)
     mq_close(client_q);
 }
 
-void innitial_commands()
-{
-    std::cout << "+++++     commands for chat server    +++++" << std::endl;
-    std::cout << "===========================================" << std::endl;
-    std::cout << "===== JOIN  -- JOIN:<room_name>       =====" << std::endl;
-    std::cout << "===== SAY   -- SAY:<message>          =====" << std::endl;
-    std::cout << "===== DM    -- DM:<target>:<message>  =====" << std::endl;
-    std::cout << "===== WHO   -- WHO:                   =====" << std::endl;
-    std::cout << "===== LEAVE -- LEAVE:                 =====" << std::endl;
-    std::cout << "===== QUIT  -- QUIT:                  =====" << std::endl;
-    std::cout << "===========================================" << std::endl;
-}
 ```
 พาร์ทที่ 2: main: การเริ่มต้น, วงวนคำสั่ง, และปิดโปรแกรม: ส่วนหลักสุดของ client ที่บอกลำดับของ client ตั้งแต่เริ่มจนจบ
 
