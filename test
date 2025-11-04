@@ -10,13 +10,24 @@
 #include <mutex>
 #include <condition_variable>
 #include <unistd.h> // สำหรับ getpid()
+#include <map>
 
+// ============================================
+// GLOBAL VARIABLES
+// ============================================
 std::mutex mtx;
 std::condition_variable cv;
-std::chrono::high_resolution_clock::time_point send_time;
+
 double total_latency_ms = 0.0;
 int received_count = 0;
 
+// เก็บเวลาเริ่มส่งของแต่ละข้อความ
+std::mutex send_times_mtx;
+std::map<std::string, std::chrono::high_resolution_clock::time_point> send_times;
+
+// ============================================
+// LISTENER FUNCTION
+// ============================================
 void listen_queue(const std::string &client_qname)
 {
     std::string qname = "/client_" + client_qname;
@@ -42,11 +53,23 @@ void listen_queue(const std::string &client_qname)
             buf[n] = '\0';
             std::string msg(buf);
 
-            // สมมติว่า server broadcast กลับมา message เดิม
+            // ตรวจสอบว่าเป็นข้อความ message_x หรือไม่
             if (msg.find("message_") != std::string::npos)
             {
+                std::string msg_id = msg.substr(msg.find("message_")); // เช่น message_123
                 auto end_time = std::chrono::high_resolution_clock::now();
-                double latency_ms = std::chrono::duration<double, std::milli>(end_time - send_time).count();
+
+                std::chrono::high_resolution_clock::time_point start_time;
+
+                {
+                    std::lock_guard<std::mutex> lock(send_times_mtx);
+                    if (send_times.count(msg_id) == 0)
+                        continue; // ถ้าไม่มี timestamp ก็ข้าม
+                    start_time = send_times[msg_id];
+                    send_times.erase(msg_id); // ใช้แล้วลบทิ้ง
+                }
+
+                double latency_ms = std::chrono::duration<double, std::milli>(end_time - start_time).count();
 
                 std::unique_lock<std::mutex> lock(mtx);
                 total_latency_ms += latency_ms;
@@ -59,6 +82,9 @@ void listen_queue(const std::string &client_qname)
     mq_close(client_q);
 }
 
+// ============================================
+// MAIN FUNCTION
+// ============================================
 int main()
 {
     const int TOTAL_MESSAGES = 100000; // จำนวนข้อความที่ต้องการวัด latency
@@ -97,10 +123,14 @@ int main()
 
     for (int i = 0; i < TOTAL_MESSAGES; ++i)
     {
-        std::string msg = "SAY:[" + CLIENT_NAME + "]: message_" + std::to_string(i);
+        std::string msg_id = "message_" + std::to_string(i);
+        std::string msg = "SAY:[" + CLIENT_NAME + "]: " + msg_id;
 
-        // จับเวลาเริ่มก่อนส่ง
-        send_time = std::chrono::high_resolution_clock::now();
+        auto now = std::chrono::high_resolution_clock::now();
+        {
+            std::lock_guard<std::mutex> lock(send_times_mtx);
+            send_times[msg_id] = now;
+        }
 
         if (mq_send(server_q, msg.c_str(), msg.size() + 1, 0) == -1)
         {
@@ -134,4 +164,3 @@ int main()
     mq_close(server_q);
     return 0;
 }
-
