@@ -643,45 +643,20 @@ void handle_quit(const std::string &msg)
 
     std::cout << client_name << " has quit the server." << std::endl;
 
-    // Broadcast ออกจากห้อง / ออกจากระบบ แบบเลือกโหมด
-    if (mode == "leave_then_quit")
+     if (!room_left.empty())
     {
-        if (!room_left.empty())
-        {
-            BroadcastTask left_task;
-            left_task.sender_name = client_name;
-            left_task.message_payload = "[SYSTEM]: " + client_name + " has left #" + room_left;
-            left_task.target_room = room_left;
-            broadcast_queue.push(left_task);
-        }
-        if (!room_left.empty())
-        {
-            BroadcastTask quit_task;
-            quit_task.sender_name = client_name;
-            quit_task.message_payload = "[SYSTEM]: " + client_name + " has quit";
-            quit_task.target_room = room_left;
-            broadcast_queue.push(quit_task);
-        }
+        BroadcastTask quit_task;
+        quit_task.sequence_id = ++global_sequence_id; // Use pre-increment to ensure atomic increment and fetch
+        quit_task.sender_name = client_name;
+        quit_task.message_payload = "[SEQ:" + std::to_string(quit_task.sequence_id) + "] [SYSTEM]: " + client_name + " has quit";
+        quit_task.target_room = room_left;
+        broadcast_queue.push(quit_task);
     }
-    else // mode == "quit"
-    {
-        if (!room_left.empty())
-        {
-            BroadcastTask quit_task;
-            quit_task.sender_name = client_name;
-            quit_task.message_payload = "[SYSTEM]: " + client_name + " has quit";
-            quit_task.target_room = room_left;
-            broadcast_queue.push(quit_task);
-        }
-    }
-
-    // เอา client นี้ออกจากตาราง heartbeat
-    {
-        std::lock_guard<std::mutex> lock(heartbeat_mutex);
-        client_heartbeats.erase(client_name);
-    }
+    //เอา client ออกจากตาราง heartbeats
+    std::lock_guard<std::mutex> lock(heartbeat_mutex);
+    client_heartbeats.erase(client_name);
 }
-
+    
 ```
 ---
 ส่วนที่ 3: ระบบประมวลผลและกระจายข้อความ (Processing & Broadcast System)
