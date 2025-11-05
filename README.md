@@ -1489,6 +1489,7 @@ QUIT:
 Performance
 ---
 
+โดยผล result นี้ test จำนวน 5 client , Thread 1 2 4 8 16 32 64 : test run  เเต่ละ thread อย่างละ 10 รอบ
 
 <img src=".\result\Screenshot 2025-11-05 113459.png" alt="Average Total Time">
 
@@ -1531,3 +1532,8 @@ Performance
 ---
 
 จาก result สรุปได้ว่า การเพิ่มจำนวน threads ของ client จาก 1 เป็น 2 ช่วยให้ระบบสามารถประมวลผลแบบขนาน (concurrent) ได้มากขึ้น ทำให้เวลาเฉลี่ยในการทำงานลดลงและ throughput เพิ่มขึ้นอย่างมีนัยสำคัญ เเต่ เมื่อเพิ่มจำนวน threads มากกว่า 4 ขึ้นไป ประสิทธิภาพของระบบไม่ดีขึ้นอีก เนื่องจากระบบถึงจุดอิ่มตัว (saturation point) โดยมีสาเหตุจากข้อจำกัดด้านการประมวลผลของ server, การรอคิวของ message queue หรือ overhead ในการจัดการ threads ที่มากเกินไป ซึ่งเป็นสัญญาณของ bottleneck ด้าน server หรือ I/O ที่กลายเป็นปัจจัยจำกัดหลักของระบบในช่วงดังกล่าว
+
+---
+Data used to calculate performance
+
+<a href = "https://docs.google.com/spreadsheets/d/18p6-AiQapvRTCaITO0GdAeLitdVEqUZKddTcx9YSFkg/edit?gid=0#gid=0">
