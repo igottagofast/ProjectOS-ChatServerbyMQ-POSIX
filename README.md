@@ -91,6 +91,7 @@ std::vector<std::string> client_queues;
 // เก็บเวลา heartbeat ล่าสุดของ client แต่ละคน
 std::map<std::string, std::chrono::steady_clock::time_point> client_heartbeats;
 std::mutex heartbeat_mutex;  // ป้องกัน map นี้โดยเฉพาะเพราะใช้บ่อย
+std::atomic<int> global_sequence_id(0);
 
 ```
 ---
@@ -121,7 +122,7 @@ void heartbeat_cleaner()
 
         std::vector<std::string> dead_clients;
         auto now = std::chrono::steady_clock::now();
-        const int TIMEOUT_SECONDS = 30;
+        const int TIMEOUT_SECONDS = 600000000;
 
         // หา client ที่ตาย
         {
