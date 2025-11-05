@@ -1490,3 +1490,13 @@ Performance
 ---
 
 
+<img src=".\result\Screenshot 2025-11-05 113459.png" alt="Average Total Time">
+
+---
+
+<img src=".\result\Screenshot 2025-11-05 113507.png" alt="Average Latency">
+
+---
+
+<img src=".\result\Screenshot 2025-11-05 113515.png" alt="Average Throughput">
+
