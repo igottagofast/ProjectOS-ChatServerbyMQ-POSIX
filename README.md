@@ -1513,4 +1513,4 @@ QUIT:
 Performance
 ---
 
-<img src="C:\Users\Pattama\OneDrive\Documents\OS PJ\result\Screenshot 2025-11-05 113459.png" alt="Average Total Time">
+
