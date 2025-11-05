@@ -1536,4 +1536,4 @@ Performance
 ---
 Data used to calculate performance
 
-<a href = "https://docs.google.com/spreadsheets/d/18p6-AiQapvRTCaITO0GdAeLitdVEqUZKddTcx9YSFkg/edit?gid=0#gid=0">
+https://docs.google.com/spreadsheets/d/18p6-AiQapvRTCaITO0GdAeLitdVEqUZKddTcx9YSFkg/edit?gid=0#gid=0
