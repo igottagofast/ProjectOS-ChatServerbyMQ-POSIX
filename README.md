@@ -833,10 +833,15 @@ Broadcast System ในโปรแกรมเซิร์ฟเวอร์น
 เมื่อโปรแกรมเริ่มทำงาน ฟังก์ชัน main() จะทำหน้าที่เตรียมและเปิดระบบดังนี้
 
 1.กำหนดกลไกการล็อกข้อมูลร่วมกัน (RW Lock) ใช้ pthread_rwlock_init() เพื่อป้องกันการเข้าถึงข้อมูลห้อง (room_members) พร้อมกันจากหลาย thread
+
 2.สร้างกลุ่ม Broadcaster Workers สร้างเธรดหลายตัวด้วย std::thread(broadcaster_worker).detach() เพื่องานกระจายข้อความ (ดู พาร์ท Broadcast System) ซึ่งช่วยให้การส่งข้อความไม่ไปรบกวน main thread
+
 3.เริ่มต้น Heartbeat Cleaner Thread เธรดนี้เรียก heartbeat_cleaner() คอยตรวจสอบ client ที่ไม่ส่งสัญญาณ PING ภายในเวลาที่กำหนด หากหมดเวลา จะลบออกจากระบบโดยอัตโนมัติ
+
 4.เปิด Message Queue หลักของ Server ใช้ mq_open("/server", O_CREAT | O_RDWR, 0644, &attr) เพื่อสร้างและเปิด queue กลางชื่อ /server เป็นช่องทางรับข้อความจากทุก client
+
 5.เข้าสู่ลูปรับข้อความ (Main Loop) ใช้ mq_receive() รับข้อความจาก queue ของ client ทีละข้อความ จากนั้นตรวจสอบ prefix ของข้อความว่าเป็นคำสั่งใด เช่น REGISTER:, JOIN:, SAY: หรือ QUIT: แล้วส่งต่อไปยังฟังก์ชัน handler ที่เกี่ยวข้อง
+
 6.เชื่อมโยงกับระบบ Broadcast เมื่อ handler ใด (เช่น handle_join, handle_leave, handle_quit, หรือ handle_say) ตรวจพบเหตุการณ์ที่ต้องแจ้งต่อผู้อื่น จะสร้าง BroadcastTask ใหม่และใส่งานลงใน broadcast_queue เพื่อให้ broadcaster_worker() ทำการกระจายข้อความต่อ
 
 ดังนั้น Main System ทำหน้าที่สร้างและส่งงาน ในขณะที่ Broadcast System ทำหน้าที่รับงานและกระจายงานนั้นต่อ
@@ -1192,6 +1197,7 @@ int main(int argc, char *argv[])
 
 ```
 พาร์ทที่ 3: Command Instruction วงวนหลักโต้ตอบกับผู้ใช้ และ cleanup
+
 อ่าน input จาก std::cin ทีละบรรทัด วิเคราะห์ prefix เพื่อดูว่าเป็นคำสั่งประเภทไหน แล้วแพ็กข้อความตามโปรโตคอล ก่อนส่งไป server ผ่านคิว /server
 
 คำสั่งหลัก:
@@ -1506,3 +1512,5 @@ QUIT:
 
 Performance
 ---
+
+<img src="C:\Users\Pattama\OneDrive\Documents\OS PJ\result\Screenshot 2025-11-05 113459.png" alt="Average Total Time">
